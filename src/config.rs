@@ -15,7 +15,7 @@ pub struct Config {
 }
 
 fn default_retention_days() -> u32 {
-    90
+    45
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -60,6 +60,8 @@ pub struct ExtendedRouteMatcher {
     #[serde(alias = "app_id")]
     pub app_identifier: Option<String>,
     pub environment: Option<String>,
+    #[serde(default)]
+    pub provider: Option<String>,
 }
 
 const EXTENDED_MATCHER_PREFIX: &str = "__fanout_extended_matcher__:";
@@ -75,6 +77,7 @@ impl RouteMatcher {
                 metadata_app: self.metadata_app.clone(),
                 plan_code_prefix: self.plan_code_prefix.clone(),
                 reference_prefix: self.reference_prefix.clone(),
+                provider: None,
                 ..ExtendedRouteMatcher::default()
             };
         };
@@ -91,20 +94,23 @@ impl RouteMatcher {
             reference_prefix,
             app_identifier,
             environment,
+            provider,
         } = matcher;
-        let metadata_app = if app_identifier.is_some() || environment.is_some() {
-            let encoded = serde_json::to_string(&ExtendedRouteMatcher {
-                metadata_app,
-                plan_code_prefix: None,
-                reference_prefix: None,
-                app_identifier,
-                environment,
-            })
-            .unwrap_or_default();
-            Some(format!("{EXTENDED_MATCHER_PREFIX}{encoded}"))
-        } else {
-            metadata_app
-        };
+        let metadata_app =
+            if app_identifier.is_some() || environment.is_some() || provider.is_some() {
+                let encoded = serde_json::to_string(&ExtendedRouteMatcher {
+                    metadata_app,
+                    plan_code_prefix: None,
+                    reference_prefix: None,
+                    app_identifier,
+                    environment,
+                    provider,
+                })
+                .unwrap_or_default();
+                Some(format!("{EXTENDED_MATCHER_PREFIX}{encoded}"))
+            } else {
+                metadata_app
+            };
         Self {
             metadata_app,
             plan_code_prefix,
@@ -124,6 +130,8 @@ struct RouteMatcherWire {
     #[serde(alias = "app_id")]
     app_identifier: Option<String>,
     environment: Option<String>,
+    #[serde(default)]
+    provider: Option<String>,
 }
 
 impl<'de> Deserialize<'de> for RouteMatcher {
@@ -138,6 +146,7 @@ impl<'de> Deserialize<'de> for RouteMatcher {
             reference_prefix: wire.reference_prefix,
             app_identifier: wire.app_identifier,
             environment: wire.environment,
+            provider: wire.provider,
         }))
     }
 }
@@ -251,6 +260,10 @@ impl Config {
                     .is_some_and(|name| names.contains(&name.to_string())),
             "fallback must be unrouted or route:<configured route>"
         );
+        anyhow::ensure!(
+            self.retention_days <= 45,
+            "retention must be at most 45 days"
+        );
         for source in self.source.values() {
             anyhow::ensure!(
                 crate::provider::known_providers().contains(&source.provider.as_str()),
@@ -287,7 +300,7 @@ mod tests {
         assert!(source.service_account.is_none());
         assert!(config.route.is_empty());
         assert_eq!(config.fallback.mode, "unrouted");
-        assert_eq!(config.retention_days, 90);
+        assert_eq!(config.retention_days, 45);
     }
 
     #[test]

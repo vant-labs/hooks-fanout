@@ -5,6 +5,7 @@ use std::{
     time::Instant,
 };
 
+use anyhow::Context;
 use axum::{
     Json, Router,
     body::Bytes,
@@ -380,7 +381,7 @@ pub(crate) async fn ingest(
         &body,
         provider_runtime.borrowed(source_config),
     );
-    let normalized = match initial_normalized {
+    let mut normalized = match initial_normalized {
         Some(event) => provider
             .enrich_normalized_event(
                 event.clone(),
@@ -392,6 +393,21 @@ pub(crate) async fn ingest(
             .or(Some(event)),
         None => None,
     };
+    if let Some(event) = normalized.as_mut()
+        && event.account_id.is_none()
+        && let Some(purchase_key) = event.purchase_key()
+    {
+        event.account_id = sqlx::query_scalar::<_, String>(
+            "SELECT account_id FROM store_purchases
+             WHERE provider = $1 AND purchase_key = $2 AND account_id IS NOT NULL",
+        )
+        .bind(&event.provider)
+        .bind(purchase_key)
+        .fetch_optional(&state.db.pool)
+        .await
+        .ok()
+        .flatten();
+    }
     let event_type = normalized
         .as_ref()
         .map(|event| event.event_type().to_owned())
@@ -437,12 +453,6 @@ pub(crate) async fn ingest(
         .and_then(|value| value.to_str().ok())
         .unwrap_or("application/json");
     let stored_headers = headers_to_json(&headers, provider);
-    if let Some(event) = normalized.as_ref()
-        && let Err(error) = apply_entitlement_event(&state.db, event).await
-    {
-        tracing::warn!(source = %source, error = %error, "normalized purchase event was rejected");
-        return StatusCode::CONFLICT.into_response();
-    }
     let normalized_body = normalized
         .as_ref()
         .and_then(|event| serde_json::to_vec(event).ok());
@@ -466,6 +476,7 @@ pub(crate) async fn ingest(
             Some(match decision.source {
                 MatchSource::AppIdentifier => "app_identifier",
                 MatchSource::Environment => "environment",
+                MatchSource::Provider => "provider",
                 MatchSource::MetadataApp => "metadata.app",
                 MatchSource::PlanCode => "plan_code",
                 MatchSource::Reference => "reference",
@@ -530,17 +541,6 @@ pub(crate) async fn ingest(
         }
     }
     StatusCode::OK.into_response()
-}
-
-async fn apply_entitlement_event(db: &Database, event: &NormalizedEvent) -> anyhow::Result<()> {
-    match db.apply_normalized_event(event).await? {
-        PurchaseApplyResult::CrossAccountReplay => {
-            anyhow::bail!("store purchase is already owned by another account")
-        }
-        PurchaseApplyResult::Applied
-        | PurchaseApplyResult::Unowned
-        | PurchaseApplyResult::UnmappedProduct => Ok(()),
-    }
 }
 
 #[derive(Debug, Deserialize, ToSchema)]
@@ -839,7 +839,22 @@ async fn store_normalized_event(
     } else {
         "unrouted"
     };
-    let headers = json!({"content-type": "application/json"});
+    let source_secret = state
+        .runtime_secrets
+        .read()
+        .await
+        .get(source)
+        .cloned();
+    let secret = std::env::var("PAYSTACK_WEBHOOK_SECRET")
+        .ok()
+        .or(source_secret)
+        .or_else(|| std::env::var("PAYSTACK_SECRET_KEY").ok())
+        .context("Fanout forward secret is not configured")?;
+    let signature = crate::security::sign_forward(secret.as_bytes(), normalized_body);
+    let headers = json!({
+        "content-type": "application/json",
+        "x-fanout-signature": signature,
+    });
     let inserted = state
         .db
         .insert_event_with_provider_event_id_and_normalized(
@@ -1297,6 +1312,7 @@ pub(crate) async fn create_admin_route(
                 reference_prefix: body.ref_prefix.clone(),
                 app_identifier: body.app_identifier.clone(),
                 environment: body.environment.clone(),
+                provider: None,
             },
             body.enabled.unwrap_or(true),
         )

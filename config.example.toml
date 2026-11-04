@@ -7,28 +7,53 @@ allowed_ips = ["52.31.139.75", "52.49.173.169", "52.214.14.220"]
 # Secret values are referenced by *_env settings and are never committed.
 [source.apple_production]
 provider = "apple_server_notifications"
-secret_env = "APPLE_API_PRIVATE_KEY"
+secret_env = "PAYSTACK_SECRET_KEY"
 [source.apple_production.provider_config]
-app_identifier = "com.example.timamu"
+app_identifier = "com.vant.presslit.presslitMobile"
 environment = "production"
 key_id_env = "APPLE_API_KEY_ID"
 issuer_id_env = "APPLE_API_ISSUER_ID"
 private_key_env = "APPLE_API_PRIVATE_KEY"
-"product_licence.com.example.timamu.monthly" = "timamu_pro"
+"product_licence.com.vant.timamu.premium.monthly" = "timamu_pro"
+
+[source.apple_sandbox]
+provider = "apple_server_notifications"
+secret_env = "PAYSTACK_SECRET_KEY"
+[source.apple_sandbox.provider_config]
+app_identifier = "com.vant.presslit.presslitMobile"
+environment = "sandbox"
+key_id_env = "APPLE_API_KEY_ID"
+issuer_id_env = "APPLE_API_ISSUER_ID"
+private_key_env = "APPLE_API_PRIVATE_KEY"
 
 [source.google_production]
 provider = "google_play_rtdn"
-secret_env = "GOOGLE_SERVICE_ACCOUNT_JSON"
+secret_env = "PAYSTACK_SECRET_KEY"
 [source.google_production.provider_config]
-app_identifier = "com.example.timamu"
+app_identifier = "com.vant.presslit.presslit_mobile"
 environment = "production"
 service_account_key_env = "GOOGLE_SERVICE_ACCOUNT_JSON"
-"product_licence.timamu_monthly" = "timamu_pro"
+"product_licence.com.vant.timamu.premium.monthly" = "timamu_pro"
 
 [[route]]
 name = "timamu"
-destination_url = "https://example.invalid/timamu/paystack/webhook"
+destination_url = "https://api.timamu.app/v1/webhooks/paystack"
 match = { metadata_app = "timamu", plan_code_prefix = "PLN_tm", reference_prefix = "tm_" }
+
+[[route]]
+name = "timamu_apple_production"
+destination_url = "https://api.timamu.app/v1/webhooks/apple"
+match = { provider = "apple", app_identifier = "com.vant.presslit.presslitMobile", environment = "production" }
+
+[[route]]
+name = "timamu_apple_sandbox"
+destination_url = "https://api.timamu.app/v1/webhooks/apple"
+match = { provider = "apple", app_identifier = "com.vant.presslit.presslitMobile", environment = "sandbox" }
+
+[[route]]
+name = "timamu_google_production"
+destination_url = "https://api.timamu.app/v1/webhooks/google"
+match = { provider = "google", app_identifier = "com.vant.presslit.presslit_mobile", environment = "production" }
 
 [[route]]
 name = "screencrafter"

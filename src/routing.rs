@@ -13,6 +13,7 @@ pub enum MatchSource {
     MetadataApp,
     PlanCode,
     Reference,
+    Provider,
     Fallback,
 }
 
@@ -34,6 +35,7 @@ pub fn database_route<'a>(
             reference_prefix: route.ref_prefix.clone(),
             app_identifier: None,
             environment: None,
+            provider: None,
         };
         route_matches(&matcher, &fields)
     })
@@ -49,6 +51,7 @@ pub fn database_route_records<'a>(
         MatchSource::Reference,
         MatchSource::AppIdentifier,
         MatchSource::Environment,
+        MatchSource::Provider,
     ] {
         if let Some(route) = routes
             .iter()
@@ -72,6 +75,10 @@ pub fn route_matches(
             .environment
             .as_deref()
             .is_none_or(|value| fields.environment.as_deref() == Some(value));
+    let provider_matches = matcher
+        .provider
+        .as_deref()
+        .is_none_or(|value| fields.provider.as_deref() == Some(value));
     let legacy_rules_configured = matcher.metadata_app.is_some()
         || matcher.plan_code_prefix.is_some()
         || matcher.reference_prefix.is_some();
@@ -91,7 +98,7 @@ pub fn route_matches(
                 .as_deref()
                 .is_some_and(|value| value.starts_with(prefix))
         });
-    identity_matches && (!legacy_rules_configured || legacy_matches)
+    provider_matches && identity_matches && (!legacy_rules_configured || legacy_matches)
 }
 
 pub fn match_source(
@@ -138,6 +145,13 @@ pub fn match_source(
     {
         return Some(MatchSource::Environment);
     }
+    if matcher
+        .provider
+        .as_deref()
+        .is_some_and(|value| fields.provider.as_deref() == Some(value))
+    {
+        return Some(MatchSource::Provider);
+    }
     None
 }
 
@@ -168,6 +182,7 @@ pub fn decide_with_fields(
         MatchSource::Reference,
         MatchSource::AppIdentifier,
         MatchSource::Environment,
+        MatchSource::Provider,
     ] {
         if let Some(route) = config.route.iter().find(|route| {
             match_source(&route.matcher.extended(), fields).as_ref() == Some(&preferred_source)
@@ -228,6 +243,7 @@ pub fn routing_fields_from_payload(payload: &Value) -> RoutingFields {
                     .and_then(Value::as_str)
                     .map(str::to_owned)
             }),
+        ..RoutingFields::default()
     }
 }
 
@@ -362,6 +378,40 @@ mod tests {
             "data": {"bundleId":"com.example.store","environment":"sandbox"}
         });
         assert!(decide(&c, &wrong_environment).route.is_none());
+    }
+
+    #[test]
+    fn provider_routes_match_normalized_store_events() {
+        let mut c = config();
+        c.route = vec![RouteConfig {
+            name: "timamu-google".into(),
+            destination_url: "https://api.timamu.app/v1/webhooks/google".into(),
+            matcher: RouteMatcher::from_extended(ExtendedRouteMatcher {
+                provider: Some("google".into()),
+                app_identifier: Some("com.vant.presslit.presslit_mobile".into()),
+                environment: Some("production".into()),
+                ..ExtendedRouteMatcher::default()
+            }),
+        }];
+        let event = crate::provider::NormalizedEvent {
+            schema_version: 1,
+            provider: "google".into(),
+            event_id: "evt-1".into(),
+            kind: crate::provider::NormalizedEventKind::Purchase,
+            account_id: Some("account-1".into()),
+            transaction_id: None,
+            original_transaction_id: None,
+            purchase_token: Some("token-1".into()),
+            product_id: "product-1".into(),
+            licence: None,
+            app_identifier: "com.vant.presslit.presslit_mobile".into(),
+            environment: "production".into(),
+            expires_at: None,
+            raw: serde_json::json!({}),
+        };
+        let decision = decide_with_fields(&c, &Value::Null, &event.routing_fields());
+        assert_eq!(decision.route.unwrap().name, "timamu-google");
+        assert_eq!(decision.source, MatchSource::AppIdentifier);
     }
 
     #[test]

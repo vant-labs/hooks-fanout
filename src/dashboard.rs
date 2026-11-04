@@ -1205,6 +1205,7 @@ async fn save_route(
         reference_prefix: clean_option(form.reference_prefix),
         app_identifier: clean_option(form.app_identifier),
         environment,
+        provider: None,
     });
     match state
         .db

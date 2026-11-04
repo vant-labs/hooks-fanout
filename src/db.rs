@@ -458,11 +458,13 @@ impl Database {
                     matcher.app_identifier = row
                         .try_get::<Option<String>, _>("app_identifier")
                         .ok()
-                        .flatten();
+                        .flatten()
+                        .or(matcher.app_identifier);
                     matcher.environment = row
                         .try_get::<Option<String>, _>("environment")
                         .ok()
-                        .flatten();
+                        .flatten()
+                        .or(matcher.environment);
                     Some(RouteConfig {
                         name,
                         destination_url,
@@ -540,8 +542,8 @@ impl Database {
         alert_url: Option<&str>,
     ) -> Result<()> {
         anyhow::ensure!(
-            (1..=3_650).contains(&retention_days),
-            "retention must be between 1 and 3650 days"
+            (1..=45).contains(&retention_days),
+            "retention must be between 1 and 45 days"
         );
         anyhow::ensure!(
             fallback_mode == "unrouted" || fallback_mode.starts_with("route:"),
@@ -1941,6 +1943,10 @@ impl Database {
 
     pub async fn prune_delivered(&self, retention_days: u32) -> Result<u64> {
         sqlx::query("DELETE FROM deliveries WHERE created_at < now() - interval '30 days' AND status IN ('delivered', 'dead')")
+            .execute(&self.pool)
+            .await?;
+        sqlx::query("UPDATE events SET raw_body = decode('', 'hex'), normalized_body = NULL WHERE received_at < now() - make_interval(days => $1) AND raw_body <> decode('', 'hex')")
+            .bind(i32::try_from(retention_days)?)
             .execute(&self.pool)
             .await?;
         let result = sqlx::query("DELETE FROM events WHERE status = 'delivered' AND delivered_at < now() - make_interval(days => $1)").bind(i32::try_from(retention_days)?).execute(&self.pool).await?;
