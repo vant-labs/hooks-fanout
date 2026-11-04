@@ -839,12 +839,7 @@ async fn store_normalized_event(
     } else {
         "unrouted"
     };
-    let source_secret = state
-        .runtime_secrets
-        .read()
-        .await
-        .get(source)
-        .cloned();
+    let source_secret = state.runtime_secrets.read().await.get(source).cloned();
     let secret = std::env::var("PAYSTACK_WEBHOOK_SECRET")
         .ok()
         .or(source_secret)
