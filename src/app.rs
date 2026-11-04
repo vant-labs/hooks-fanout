@@ -50,6 +50,9 @@ pub struct AppState {
     pub purchase_jwt_secret: Option<String>,
     pub purchase_bearer_token: Option<String>,
     pub purchase_bearer_account_id: Option<String>,
+    /// Existing PressLit sessions are opaque tokens.  This origin is used
+    /// only after the JWT/static purchase credentials do not match.
+    pub timamu_api_base_url: String,
     pub cookie_secure: bool,
     pub login_limits: Arc<std::sync::Mutex<HashMap<String, (u32, Instant)>>>,
     pub runtime_config: Arc<tokio::sync::RwLock<Config>>,
@@ -91,6 +94,10 @@ impl AppState {
                 .or_else(|| std::env::var("JWT_SECRET").ok()),
             purchase_bearer_token: std::env::var("PURCHASE_BEARER_TOKEN").ok(),
             purchase_bearer_account_id: std::env::var("PURCHASE_BEARER_ACCOUNT_ID").ok(),
+            timamu_api_base_url: std::env::var("TIMAMU_API_BASE_URL")
+                .unwrap_or_else(|_| "https://api.timamu.app".to_owned())
+                .trim_end_matches('/')
+                .to_owned(),
             cookie_secure: std::env::var("COOKIE_SECURE")
                 .map(|value| !value.eq_ignore_ascii_case("false"))
                 .unwrap_or(true),
@@ -575,7 +582,7 @@ fn identity_account_id(claims: PurchaseIdentityClaims) -> Option<String> {
         .filter(|value| !value.trim().is_empty())
 }
 
-fn verified_purchase_account_id(
+async fn verified_purchase_account_id(
     state: &AppState,
     headers: &HeaderMap,
 ) -> Result<String, StatusCode> {
@@ -616,7 +623,31 @@ fn verified_purchase_account_id(
             .ok_or(StatusCode::FORBIDDEN);
     }
 
-    Err(StatusCode::UNAUTHORIZED)
+    // PressLit account sessions are intentionally opaque and are not a
+    // second purchase credential. Introspect the already-authenticated
+    // session at Timamu, then use only the returned account id for Fanout's
+    // store-account binding.
+    let response = state
+        .http
+        .get(format!("{}/v1/account/session", state.timamu_api_base_url))
+        .bearer_auth(token)
+        .send()
+        .await
+        .map_err(|_| StatusCode::UNAUTHORIZED)?;
+    if !response.status().is_success() {
+        return Err(StatusCode::UNAUTHORIZED);
+    }
+    let body: serde_json::Value = response
+        .json()
+        .await
+        .map_err(|_| StatusCode::UNAUTHORIZED)?;
+    body.get("accountId")
+        .or_else(|| body.get("account_id"))
+        .and_then(|value| value.as_str())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_owned)
+        .ok_or(StatusCode::FORBIDDEN)
 }
 
 #[utoipa::path(
@@ -638,7 +669,7 @@ pub(crate) async fn verify_purchase(
     headers: HeaderMap,
     Json(body): Json<VerifyPurchaseBody>,
 ) -> Response {
-    let account_id = match verified_purchase_account_id(&state, &headers) {
+    let account_id = match verified_purchase_account_id(&state, &headers).await {
         Ok(account_id) => account_id,
         Err(status) => return status.into_response(),
     };
@@ -792,7 +823,7 @@ pub(crate) async fn list_entitlements(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
 ) -> Response {
-    let account_id = match verified_purchase_account_id(&state, &headers) {
+    let account_id = match verified_purchase_account_id(&state, &headers).await {
         Ok(account_id) => account_id,
         Err(status) => return status.into_response(),
     };
