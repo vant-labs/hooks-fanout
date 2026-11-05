@@ -390,6 +390,45 @@ async fn swagger_docs_are_available_at_docs() {
 
 #[tokio::test]
 #[serial]
+async fn configuration_page_lists_source_paste_url_and_edit_action() {
+    if !can_run() {
+        return;
+    }
+    let (state, db) = setup().await;
+    db.create_owner(
+        "owner@example.com",
+        &hash_password("long secure password").unwrap(),
+    )
+    .await
+    .unwrap();
+    let (cookie, csrf) = login(state.clone(), "owner@example.com", "long secure password").await;
+    let slug = format!("ui-{}", Uuid::new_v4());
+    let save = request(
+        state.clone(),
+        "POST",
+        "/dashboard/config/source",
+        Some(&cookie),
+        Some(&format!(
+            "csrf={csrf}&name=UI+source&path_slug={slug}&provider=apple_server_notifications&provider_config=%7B%7D&enabled=on"
+        )),
+    )
+    .await;
+    assert_eq!(save.status(), StatusCode::SEE_OTHER);
+    let page = request(state, "GET", "/dashboard/config", Some(&cookie), None).await;
+    assert_eq!(page.status(), StatusCode::OK);
+    let body = to_bytes(page.into_body(), usize::MAX).await.unwrap();
+    assert!(
+        body.windows(slug.len())
+            .any(|window| window == slug.as_bytes())
+    );
+    assert!(
+        body.windows(b"https://vant-way.up.railway.app/in/".len())
+            .any(|window| window == b"https://vant-way.up.railway.app/in/")
+    );
+}
+
+#[tokio::test]
+#[serial]
 async fn overview_health_uses_one_real_postgres_point_and_shows_empty_state() {
     if !can_run() {
         return;

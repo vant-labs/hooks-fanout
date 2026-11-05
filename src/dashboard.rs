@@ -156,11 +156,41 @@ struct ConfigurationPage {
     user: SessionUser,
     sources: Vec<SourceView>,
     routes: Vec<RouteView>,
+    source_editor: SourceEditor,
     editor: RouteEditor,
     csrf: String,
     message: Option<String>,
     error: Option<String>,
     test_result: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+struct SourceEditor {
+    name: String,
+    path_slug: String,
+    provider: String,
+    allowed_ips: String,
+    audience: String,
+    service_account: String,
+    provider_config: String,
+    editing: bool,
+    enabled: bool,
+}
+
+impl Default for SourceEditor {
+    fn default() -> Self {
+        Self {
+            name: String::new(),
+            path_slug: String::new(),
+            provider: "paystack".to_owned(),
+            allowed_ips: String::new(),
+            audience: String::new(),
+            service_account: String::new(),
+            provider_config: "{}".to_owned(),
+            editing: false,
+            enabled: true,
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -247,11 +277,15 @@ struct RouteForm {
 struct SourceForm {
     csrf: String,
     name: String,
+    path_slug: String,
+    original_path_slug: Option<String>,
     provider: String,
     secret: Option<String>,
     allowed_ips: Option<String>,
     audience: Option<String>,
     service_account: Option<String>,
+    provider_config: Option<String>,
+    credentials: Option<String>,
     enabled: Option<String>,
 }
 
@@ -295,6 +329,7 @@ struct ExportQuery {
 #[derive(Debug, Clone, Default, Deserialize)]
 struct ConfigurationQuery {
     edit: Option<String>,
+    edit_source: Option<String>,
 }
 
 async fn login(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Response {
@@ -1093,6 +1128,23 @@ async fn configuration(
         Ok(routes) => routes,
         Err(error) => return server_error(error),
     };
+    let source_editor = query
+        .edit_source
+        .as_deref()
+        .and_then(|slug| sources.iter().find(|source| source.path_slug == slug))
+        .map(|source| SourceEditor {
+            name: source.name.clone(),
+            path_slug: source.path_slug.clone(),
+            provider: source.provider.clone(),
+            allowed_ips: source.allowed_ips.join(", "),
+            audience: source.audience.clone().unwrap_or_default(),
+            service_account: source.service_account.clone().unwrap_or_default(),
+            provider_config: serde_json::to_string_pretty(&source.provider_config)
+                .unwrap_or_else(|_| "{}".to_owned()),
+            editing: true,
+            enabled: source.enabled,
+        })
+        .unwrap_or_default();
     let editor = query
         .edit
         .as_deref()
@@ -1115,6 +1167,7 @@ async fn configuration(
         user,
         sources,
         routes,
+        source_editor,
         editor,
         csrf: current_csrf(&state, &headers).await.unwrap_or_default(),
         message: None,
@@ -1253,10 +1306,14 @@ async fn save_source(
         return (StatusCode::FORBIDDEN, "Owner access is required").into_response();
     }
     let name = form.name.trim();
-    if name.is_empty() || !crate::provider::supported_providers().contains(&form.provider.trim()) {
+    let path_slug = form.path_slug.trim();
+    if name.is_empty()
+        || !crate::provider::supported_providers().contains(&form.provider.trim())
+        || !crate::app::valid_source_slug(path_slug)
+    {
         return (
             StatusCode::BAD_REQUEST,
-            "A source name and a supported provider are required",
+            "A source name, valid path slug, and supported provider are required",
         )
             .into_response();
     }
@@ -1297,15 +1354,47 @@ async fn save_source(
         )
             .into_response();
     }
+    let provider_config = match form
+        .provider_config
+        .as_deref()
+        .filter(|value| !value.trim().is_empty())
+        .map(serde_json::from_str::<std::collections::HashMap<String, String>>)
+        .transpose()
+    {
+        Ok(value) => value,
+        Err(_) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                "Provider settings must be a JSON object",
+            )
+                .into_response();
+        }
+    };
+    let credentials = match form
+        .credentials
+        .as_deref()
+        .filter(|value| !value.trim().is_empty())
+        .map(serde_json::from_str::<std::collections::HashMap<String, String>>)
+        .transpose()
+    {
+        Ok(value) => value,
+        Err(_) => {
+            return (StatusCode::BAD_REQUEST, "Credentials must be a JSON object").into_response();
+        }
+    };
     match state
         .db
         .save_source(
+            form.original_path_slug.as_deref(),
             name,
+            path_slug,
             form.provider.trim(),
             secret,
             &allowed_ips,
             audience.as_deref(),
             service_account.as_deref(),
+            provider_config.as_ref(),
+            credentials.as_ref(),
             form.enabled.is_some(),
         )
         .await
@@ -1354,6 +1443,7 @@ async fn test_route(
         user,
         sources,
         routes,
+        source_editor: SourceEditor::default(),
         editor: RouteEditor::default(),
         csrf: current_csrf(&state, &headers).await.unwrap_or_default(),
         message: None,

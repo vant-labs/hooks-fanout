@@ -10,16 +10,42 @@
 {% if let Some(result) = test_result %}<div class="alert alert-info" role="status">{{ result }}</div>{% endif %}
 <section class="config-grid">
     <article class="panel">
-        <div class="panel-heading"><div><h2>Sources</h2><p class="muted">Webhook providers and encrypted credentials.</p></div></div>
-        {% if sources.is_empty() %}<div class="empty-state compact"><h3>No database sources yet</h3><p>Set the encryption key and restart to seed from TOML.</p></div>
+        <div class="panel-heading"><div><h2>Sources</h2><p class="muted">Ingress providers and encrypted credentials.</p></div></div>
+        {% if sources.is_empty() %}<div class="empty-state compact"><h3>No database sources yet</h3><p>Create one below or use the first-boot seed.</p></div>
         {% else %}
         <div class="config-list">
-            {% for source in sources %}<div class="config-row"><div><strong>{{ source.name }}</strong><small>{{ source.provider }} · {% if source.enabled %}enabled{% else %}disabled{% endif %} · {% if source.secret_present %}secret stored{% else %}secret missing{% endif %}</small><small>Allowed IPs: {% if source.allowed_ips.is_empty() %}any{% else %}{{ source.allowed_ips|join(", ") }}{% endif %}</small>{% if let Some(value) = source.audience %}<small>Audience: {{ value }}</small>{% endif %}{% if let Some(value) = source.service_account %}<small>Service account: {{ value }}</small>{% endif %}</div></div>{% endfor %}
+            {% for source in sources %}
+            <div class="config-row">
+                <div>
+                    <strong>{{ source.name }}</strong>
+                    <small>{{ source.provider }} · {% if source.enabled %}enabled{% else %}disabled{% endif %} · {% if source.secret_present %}secret stored{% else %}no shared secret{% endif %}</small>
+                    <small>Paste URL: <code>{{ source.ingest_url }}</code></small>
+                    <small>Allowed IPs: {% if source.allowed_ips.is_empty() %}any{% else %}{{ source.allowed_ips|join(", ") }}{% endif %}</small>
+                    {% if let Some(value) = source.audience %}<small>Audience: {{ value }}</small>{% endif %}
+                    {% if let Some(value) = source.service_account %}<small>Service account: {{ value }}</small>{% endif %}
+                    {% if !source.credential_keys.is_empty() %}<small>Stored credentials: {{ source.credential_keys|join(", ") }}</small>{% endif %}
+                </div>
+                {% if user.role.can_manage() %}<div class="row-actions"><a class="button button-secondary" href="/dashboard/config?edit_source={{ source.path_slug }}">Edit</a></div>{% endif %}
+            </div>
+            {% endfor %}
         </div>
         {% endif %}
         {% if user.role.can_manage() %}
         <form method="post" action="/dashboard/config/source" class="stack-form config-form">
-            <input type="hidden" name="csrf" value="{{ csrf }}"><h3>Add or edit source</h3><label for="source-name">Name</label><input id="source-name" name="name" placeholder="paystack_main" required><label for="provider">Provider</label><select id="provider" name="provider"><option value="paystack">paystack</option><option value="apple_server_notifications">apple_server_notifications</option><option value="apple_connect_webhooks">apple_connect_webhooks</option><option value="google_play_rtdn">google_play_rtdn</option></select><label for="secret">Secret <span class="muted">leave blank to keep the stored value</span></label><input id="secret" name="secret" type="password" autocomplete="new-password"><label for="audience">Push audience <span class="muted">Google Play only</span></label><input id="audience" name="audience" placeholder="https://example.com/in/google_main"><label for="service_account">Push service account <span class="muted">Google Play only</span></label><input id="service_account" name="service_account" type="email" placeholder="pubsub-push@example.iam.gserviceaccount.com"><label for="allowed_ips">Allowed IPs <span class="muted">comma separated</span></label><input id="allowed_ips" name="allowed_ips" placeholder="52.31.139.75, 52.49.173.169"><label class="check-label"><input type="checkbox" name="enabled" checked> Enabled</label><button class="button button-primary" type="submit">Save source</button>
+            <input type="hidden" name="csrf" value="{{ csrf }}">
+            {% if source_editor.editing %}<input type="hidden" name="original_path_slug" value="{{ source_editor.path_slug }}">{% endif %}
+            <h3>{% if source_editor.editing %}Edit source{% else %}Add source{% endif %}</h3>
+            <label for="source-name">Name</label><input id="source-name" name="name" value="{{ source_editor.name }}" placeholder="Google production" required>
+            <label for="source-path-slug">Path slug</label><input id="source-path-slug" name="path_slug" value="{{ source_editor.path_slug }}" placeholder="google_production" pattern="[A-Za-z0-9_-]+" required><small class="muted">The live path is <code>/in/{slug}</code>.</small>
+            <label for="provider">Provider</label><select id="provider" name="provider"><option value="paystack"{% if source_editor.provider == "paystack" %} selected{% endif %}>paystack</option><option value="apple_server_notifications"{% if source_editor.provider == "apple_server_notifications" %} selected{% endif %}>apple_server_notifications</option><option value="apple_connect_webhooks"{% if source_editor.provider == "apple_connect_webhooks" %} selected{% endif %}>apple_connect_webhooks</option><option value="google_play_rtdn"{% if source_editor.provider == "google_play_rtdn" %} selected{% endif %}>google_play_rtdn</option></select>
+            <label for="secret">Shared secret <span class="muted">blank keeps the stored value</span></label><input id="secret" name="secret" type="password" autocomplete="new-password">
+            <label for="audience">Push audience <span class="muted">Google Play RTDN</span></label><input id="audience" name="audience" value="{{ source_editor.audience }}" placeholder="https://your-host/in/google_production">
+            <label for="service_account">Push service account <span class="muted">Google Play RTDN</span></label><input id="service_account" name="service_account" type="email" value="{{ source_editor.service_account }}" placeholder="pubsub-push@example.iam.gserviceaccount.com">
+            <label for="allowed_ips">Allowed IPs <span class="muted">comma separated</span></label><input id="allowed_ips" name="allowed_ips" value="{{ source_editor.allowed_ips }}" placeholder="52.31.139.75, 52.49.173.169">
+            <label for="provider_config">Provider settings <span class="muted">non-secret JSON object</span></label><textarea id="provider_config" name="provider_config" rows="5" class="payload-input">{{ source_editor.provider_config }}</textarea>
+            <label for="credentials">Encrypted credentials <span class="muted">write-only JSON object; e.g. private_key, key_id, issuer_id, service_account_key</span></label><textarea id="credentials" name="credentials" rows="4" class="payload-input" placeholder='{"key_id":"...","issuer_id":"..."}'></textarea>
+            <label class="check-label"><input type="checkbox" name="enabled"{% if source_editor.enabled %} checked{% endif %}> Enabled</label>
+            <div class="row-actions"><button class="button button-primary" type="submit">Save source</button>{% if source_editor.editing %}<a class="button button-secondary" href="/dashboard/config">Cancel</a>{% endif %}</div>
         </form>
         {% endif %}
     </article>

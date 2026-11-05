@@ -145,6 +145,95 @@ async fn route_crud_and_cache_fallback_work() {
 
 #[tokio::test]
 #[serial]
+async fn source_crud_persists_slug_and_encrypted_credentials() {
+    if !can_run() {
+        return;
+    }
+    let (state, db) = setup().await;
+    let slug = format!("google-{}", Uuid::new_v4());
+    let create = request(
+        state.clone(),
+        "POST",
+        "/admin/sources",
+        Some(serde_json::json!({
+            "name": "Google production",
+            "path_slug": slug.clone(),
+            "provider": "google_play_rtdn",
+            "audience": format!("https://example.test/in/{slug}"),
+            "service_account": "pubsub@example.iam.gserviceaccount.com",
+            "provider_config": {
+                "app_identifier": "com.example.app",
+                "environment": "production",
+                "product_licence.monthly": "pro"
+            },
+            "credentials": {
+                "service_account_key": "{\"private_key\":\"not-returned\"}"
+            }
+        })),
+    )
+    .await;
+    assert_eq!(create.status(), StatusCode::CREATED);
+    let created: Value =
+        serde_json::from_slice(&to_bytes(create.into_body(), 64 * 1024).await.unwrap()).unwrap();
+    assert_eq!(created["path_slug"], slug);
+    assert_eq!(created["ingest_path"], format!("/in/{slug}"));
+    assert_eq!(
+        created["credential_keys"],
+        serde_json::json!(["service_account_key"])
+    );
+    assert!(created.get("credentials").is_none());
+
+    let patch = request(
+        state.clone(),
+        "PATCH",
+        &format!("/admin/sources/{slug}"),
+        Some(serde_json::json!({"enabled": false})),
+    )
+    .await;
+    assert_eq!(patch.status(), StatusCode::OK);
+    let updated: Value =
+        serde_json::from_slice(&to_bytes(patch.into_body(), 64 * 1024).await.unwrap()).unwrap();
+    assert_eq!(updated["enabled"], false);
+
+    state.reload_runtime_config().await.unwrap();
+    assert!(!state.runtime_config.read().await.source.contains_key(&slug));
+
+    let delete = request(state, "DELETE", &format!("/admin/sources/{slug}"), None).await;
+    assert_eq!(delete.status(), StatusCode::NO_CONTENT);
+    db.pool.close().await;
+}
+
+#[tokio::test]
+#[serial]
+async fn route_crud_accepts_store_identifier_matchers() {
+    if !can_run() {
+        return;
+    }
+    let (state, db) = setup().await;
+    let name = format!("store-route-{}", Uuid::new_v4());
+    let create = request(
+        state.clone(),
+        "POST",
+        "/admin/routes",
+        Some(serde_json::json!({
+            "name": name.clone(),
+            "target_url": "https://example.invalid/store",
+            "app_identifier": "com.example.app",
+            "environment": "sandbox",
+            "enabled": true
+        })),
+    )
+    .await;
+    assert_eq!(create.status(), StatusCode::CREATED);
+    let route: Value =
+        serde_json::from_slice(&to_bytes(create.into_body(), 64 * 1024).await.unwrap()).unwrap();
+    assert_eq!(route["app_identifier"], "com.example.app");
+    assert_eq!(route["environment"], "sandbox");
+    db.pool.close().await;
+}
+
+#[tokio::test]
+#[serial]
 async fn purchase_endpoints_reject_missing_and_bad_bearer_tokens() {
     if !can_run() {
         return;

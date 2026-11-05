@@ -21,6 +21,9 @@ fn default_retention_days() -> u32 {
 #[derive(Debug, Clone, Deserialize)]
 pub struct SourceConfig {
     pub provider: String,
+    /// Optional first-boot bootstrap env name. Runtime source credentials are
+    /// loaded from encrypted database columns after seeding.
+    #[serde(default)]
     pub secret_env: String,
     #[serde(default)]
     pub allowed_ips: Vec<IpAddr>,
