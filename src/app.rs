@@ -31,8 +31,8 @@ use crate::{
     },
     metrics::Metrics,
     provider::{
-        NormalizedEvent, Provider, ProviderRuntimeSettings, ProviderSettings,
-        PurchaseVerificationRequest, provider_for,
+        AuthenticationFailureReason, NormalizedEvent, Provider, ProviderRuntimeSettings,
+        ProviderSettings, PurchaseVerificationRequest, provider_for,
     },
     routing::{MatchSource, database_route_records, decide_with_fields, reference},
     security::bearer_matches,
@@ -355,7 +355,12 @@ pub(crate) async fn ingest(
         &headers,
         Some(remote.0.ip()),
     ) {
-        tracing::warn!(source = %source, "webhook rejected by IP allowlist");
+        tracing::warn!(
+            source = %source,
+            provider = provider.name(),
+            reason = AuthenticationFailureReason::AllowlistDenied.as_str(),
+            "webhook authentication failed"
+        );
         return StatusCode::FORBIDDEN.into_response();
     }
     let signature = provider.authenticated_header(&headers);
@@ -378,16 +383,29 @@ pub(crate) async fn ingest(
         audience: source_config.audience.as_deref(),
         service_account: source_config.service_account.as_deref(),
     };
-    if !provider
-        .authenticate_with_settings(secret.as_bytes(), &headers, &body, settings)
-        .await
-    {
+    let authentication = provider
+        .authenticate_with_settings_diagnostic(secret.as_bytes(), &headers, &body, settings)
+        .await;
+    if !authentication.authenticated {
         state
             .metrics
             .verified_failed
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         if state.metrics.should_log_signature_failure() {
-            tracing::warn!(source = %source, "webhook signature verification failed");
+            tracing::warn!(
+                source = %source,
+                provider = provider.name(),
+                reason = authentication
+                    .reason
+                    .unwrap_or(AuthenticationFailureReason::Other)
+                    .as_str(),
+                expected_aud = ?authentication.expected_aud,
+                expected_sa = ?authentication.expected_sa,
+                jwt_aud = ?authentication.jwt_aud,
+                jwt_email = ?authentication.jwt_email,
+                jwt_iss = ?authentication.jwt_iss,
+                "webhook authentication failed"
+            );
         }
         return StatusCode::UNAUTHORIZED.into_response();
     }
