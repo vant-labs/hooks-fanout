@@ -1539,13 +1539,21 @@ fn rsa_decoding_key(certificate: &[u8]) -> Option<DecodingKey> {
     match certificate.public_key().parsed().ok()? {
         PublicKey::RSA(key) => Some(
             DecodingKey::from_rsa_components(
-                &URL_SAFE_NO_PAD.encode(key.modulus),
-                &URL_SAFE_NO_PAD.encode(key.exponent),
+                &URL_SAFE_NO_PAD.encode(trim_rsa_component(key.modulus)),
+                &URL_SAFE_NO_PAD.encode(trim_rsa_component(key.exponent)),
             )
             .ok()?,
         ),
         _ => None,
     }
+}
+
+fn trim_rsa_component(component: &[u8]) -> &[u8] {
+    let first_non_zero = component
+        .iter()
+        .position(|byte| *byte != 0)
+        .unwrap_or(component.len().saturating_sub(1));
+    &component[first_non_zero..]
 }
 
 fn decoded_google_notification(payload: &Value) -> Option<Value> {
@@ -1793,7 +1801,8 @@ mod tests {
         signature::{ECDSA_P256_SHA256_FIXED_SIGNING, EcdsaKeyPair},
     };
     use rsa::{
-        RsaPrivateKey, pkcs1::EncodeRsaPrivateKey, rand_core::OsRng, traits::PublicKeyParts,
+        RsaPrivateKey, pkcs1::EncodeRsaPrivateKey, pkcs8::EncodePrivateKey, rand_core::OsRng,
+        traits::PublicKeyParts,
     };
     use sha2::Sha512;
     use time::{Duration, OffsetDateTime};
@@ -1915,6 +1924,24 @@ mod tests {
             &URL_SAFE_NO_PAD.encode(private_key.e().to_bytes_be()),
         )
         .unwrap();
+        (
+            GooglePlayRtdnProvider::with_keys(HashMap::from([(
+                "test-key".to_owned(),
+                decoding_key,
+            )])),
+            private_key,
+        )
+    }
+
+    fn google_test_provider_from_certificate() -> (GooglePlayRtdnProvider, RsaPrivateKey) {
+        let private_key = RsaPrivateKey::new(&mut OsRng, 2048).unwrap();
+        let private_der = private_key.to_pkcs8_der().unwrap();
+        let signing_key = KeyPair::try_from(private_der.as_bytes()).unwrap();
+        let certificate = CertificateParams::new(vec!["test-google-key".to_owned()])
+            .unwrap()
+            .self_signed(&signing_key)
+            .unwrap();
+        let decoding_key = rsa_decoding_key(certificate.pem().as_bytes()).unwrap();
         (
             GooglePlayRtdnProvider::with_keys(HashMap::from([(
                 "test-key".to_owned(),
@@ -2070,6 +2097,56 @@ mod tests {
                         audience: Some(audience),
                         service_account: Some("other@example.iam.gserviceaccount.com"),
                     },
+                )
+                .await
+        );
+    }
+
+    #[tokio::test]
+    async fn google_play_rtdn_verifies_a_jwt_with_a_parsed_certificate_key() {
+        let (provider, private_key) = google_test_provider_from_certificate();
+        let audience = "https://example.test/in/google_main";
+        let service_account = "pubsub@example.iam.gserviceaccount.com";
+        let token = google_test_token(
+            &private_key,
+            audience,
+            service_account,
+            chrono::Utc::now().timestamp() + 3600,
+        );
+        let mut headers = HeaderMap::new();
+        headers.insert("authorization", format!("Bearer {token}").parse().unwrap());
+        assert!(
+            provider
+                .authenticate_with_settings(
+                    &[],
+                    &headers,
+                    b"{}",
+                    google_debug_settings(audience, service_account),
+                )
+                .await
+        );
+
+        let mut tampered = token.into_bytes();
+        let signature_start = tampered.iter().rposition(|byte| *byte == b'.').unwrap() + 1;
+        tampered[signature_start] = if tampered[signature_start] == b'A' {
+            b'B'
+        } else {
+            b'A'
+        };
+        let mut tampered_headers = HeaderMap::new();
+        tampered_headers.insert(
+            "authorization",
+            format!("Bearer {}", String::from_utf8(tampered).unwrap())
+                .parse()
+                .unwrap(),
+        );
+        assert!(
+            !provider
+                .authenticate_with_settings(
+                    &[],
+                    &tampered_headers,
+                    b"{}",
+                    google_debug_settings(audience, service_account),
                 )
                 .await
         );
