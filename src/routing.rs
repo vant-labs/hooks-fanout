@@ -415,6 +415,91 @@ mod tests {
     }
 
     #[test]
+    fn store_apps_route_by_verified_identity_and_unknowns_stay_unrouted() {
+        let mut c = config();
+        c.fallback.mode = "unrouted".into();
+        c.route = vec![
+            RouteConfig {
+                name: "apple-app-one".into(),
+                destination_url: "https://app-one.example/apple".into(),
+                matcher: RouteMatcher::from_extended(ExtendedRouteMatcher {
+                    app_identifier: Some("com.example.one".into()),
+                    environment: Some("production".into()),
+                    ..ExtendedRouteMatcher::default()
+                }),
+            },
+            RouteConfig {
+                name: "apple-app-two".into(),
+                destination_url: "https://app-two.example/apple".into(),
+                matcher: RouteMatcher::from_extended(ExtendedRouteMatcher {
+                    app_identifier: Some("com.example.two".into()),
+                    environment: Some("production".into()),
+                    ..ExtendedRouteMatcher::default()
+                }),
+            },
+            RouteConfig {
+                name: "play-app-one".into(),
+                destination_url: "https://app-one.example/google".into(),
+                matcher: RouteMatcher::from_extended(ExtendedRouteMatcher {
+                    app_identifier: Some("com.example.play.one".into()),
+                    environment: Some("production".into()),
+                    ..ExtendedRouteMatcher::default()
+                }),
+            },
+            RouteConfig {
+                name: "play-app-two".into(),
+                destination_url: "https://app-two.example/google".into(),
+                matcher: RouteMatcher::from_extended(ExtendedRouteMatcher {
+                    app_identifier: Some("com.example.play.two".into()),
+                    environment: Some("production".into()),
+                    ..ExtendedRouteMatcher::default()
+                }),
+            },
+        ];
+
+        let fields = |app_identifier: &str, provider: &str| RoutingFields {
+            app_identifier: Some(app_identifier.into()),
+            environment: Some("production".into()),
+            provider: Some(provider.into()),
+            ..RoutingFields::default()
+        };
+
+        assert_eq!(
+            decide_with_fields(&c, &Value::Null, &fields("com.example.one", "apple"))
+                .route
+                .unwrap()
+                .name,
+            "apple-app-one"
+        );
+        assert_eq!(
+            decide_with_fields(&c, &Value::Null, &fields("com.example.two", "apple"))
+                .route
+                .unwrap()
+                .name,
+            "apple-app-two"
+        );
+        assert_eq!(
+            decide_with_fields(&c, &Value::Null, &fields("com.example.play.one", "google"))
+                .route
+                .unwrap()
+                .name,
+            "play-app-one"
+        );
+        assert_eq!(
+            decide_with_fields(&c, &Value::Null, &fields("com.example.play.two", "google"))
+                .route
+                .unwrap()
+                .name,
+            "play-app-two"
+        );
+
+        let decision =
+            decide_with_fields(&c, &Value::Null, &fields("com.example.unknown", "apple"));
+        assert!(decision.route.is_none());
+        assert_eq!(decision.source, MatchSource::Fallback);
+    }
+
+    #[test]
     fn legacy_route_precedes_environment_only_route() {
         let mut c = config();
         c.route.push(RouteConfig {

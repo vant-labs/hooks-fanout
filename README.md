@@ -197,6 +197,19 @@ If no route matches, `fallback.mode = "unrouted"` stores the event without a
 delivery and sends an alert. `fallback.mode = "route:name"` sends it to that
 route, which is useful during rollout.
 
+### Routing Apple and Play apps
+
+Point App Store Server Notifications V2 at the existing source URL
+`/in/apple_production` or `/in/apple_sandbox`, and point Google Play RTDN at
+`/in/google_production` (or another configured source). In the dashboard,
+create one route row per destination and set its `app_identifier` to the
+verified Apple `bundleId` or Google `packageName`, plus `environment` when the
+source is environment-specific. The same account may therefore have multiple
+Apple or Play apps routed to different destinations. Adding another Vant app
+means adding another source/route row with its identifiers; it does not require
+new Fanout code or a new silo. An unknown identifier has no default app and is
+stored in the unrouted queue.
+
 ## How to tag payments
 
 Use one stable convention per product:

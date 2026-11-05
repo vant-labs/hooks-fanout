@@ -1040,14 +1040,13 @@ fn google_normalized_event(
                 value.get("purchaseToken")?.as_str()?.to_owned(),
                 value.get("sku")?.as_str()?.to_owned(),
             )
-        } else if let Some(value) = notification.get("voidedPurchaseNotification") {
+        } else {
+            let value = notification.get("voidedPurchaseNotification")?;
             (
                 NormalizedEventKind::Refund,
                 value.get("purchaseToken")?.as_str()?.to_owned(),
                 "unknown".to_owned(),
             )
-        } else {
-            return None;
         };
     let (environment, licence) = match settings {
         Some(settings) => (
@@ -1769,6 +1768,34 @@ mod tests {
             provider.routing_fields(&payload).app_identifier.as_deref(),
             Some("com.example.app")
         );
+
+        let notification = serde_json::json!({
+            "version": "1.0",
+            "packageName": "com.example.store",
+            "subscriptionNotification": {
+                "notificationType": 4,
+                "purchaseToken": "token-1",
+                "subscriptionId": "premium-monthly"
+            }
+        });
+        let normalized_payload = serde_json::json!({
+            "message": {
+                "data": STANDARD.encode(serde_json::to_vec(&notification).unwrap()),
+                "messageId": "google-message-3"
+            }
+        });
+        let normalized = provider
+            .normalize_event_with_settings(
+                &normalized_payload,
+                b"body",
+                ProviderRuntimeSettings {
+                    environment: Some("sandbox"),
+                    ..ProviderRuntimeSettings::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(normalized.app_identifier, "com.example.store");
+        assert_eq!(normalized.environment, "sandbox");
 
         for (notification, event_type) in [
             (
