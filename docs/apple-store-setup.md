@@ -9,8 +9,8 @@ source.
 
 - An App Store app with the bundle ID and in-app purchase products configured.
 - An HTTPS endpoint reachable by App Store Server Notifications V2:
-  `https://your-host/in/apple_production` or
-  `https://your-host/in/apple_sandbox`.
+  `https://vant-way.up.railway.app/in/apple_production` or
+  `https://vant-way.up.railway.app/in/apple_sandbox`.
 - An App Store Connect API key when server-side transaction lookups are
   enabled: issuer ID, key ID, and the private key.
 - A product-to-licence mapping in the source configuration.
@@ -21,25 +21,37 @@ when the signed bundle ID and environment match the source configuration.
 
 ## Production source
 
-Add a source in the dashboard or use the first-boot configuration seed:
+In the dashboard, open Sources → Add source and create both of these rows:
+
+- `Apple production` / `apple_production` / `apple_server_notifications`, with
+  audience-independent Apple settings and `environment = "production"`.
+- `Apple sandbox` / `apple_sandbox` / `apple_server_notifications`, with the
+  same app identifier and `environment = "sandbox"`.
+
+For each row, put `key_id`, `issuer_id`, and `private_key` in the encrypted
+credentials JSON field. The paste URLs are
+`https://vant-way.up.railway.app/in/apple_production` and
+`https://vant-way.up.railway.app/in/apple_sandbox`. Saving these rows writes
+them to Postgres and does not require a redeploy.
+
+The first-boot configuration seed remains available for local setup:
 
 ```toml
 [source.apple_production]
 provider = "apple_server_notifications"
-secret_env = "APPLE_API_PRIVATE_KEY"
 
 [source.apple_production.provider_config]
 app_identifier = "com.example.timamu"
 environment = "production"
 api_base_url = "https://api.storekit.itunes.apple.com"
-key_id_env = "APPLE_API_KEY_ID"
-issuer_id_env = "APPLE_API_ISSUER_ID"
-private_key_env = "APPLE_API_PRIVATE_KEY"
+key_id_env = "APPLE_API_KEY_ID" # legacy first-boot import
+issuer_id_env = "APPLE_API_ISSUER_ID" # legacy first-boot import
+private_key_env = "APPLE_API_PRIVATE_KEY" # legacy first-boot import
 "product_licence.com.example.timamu.monthly" = "timamu_pro"
 ```
 
-`secret_env` is retained for configuration compatibility. The API key values
-must be supplied through secrets; do not commit the private key. The
+The API key values must be supplied through encrypted source credentials; do
+not commit the private key. The
 `product_licence.<product-id>` entries are the only product-to-licence mapping
 used by the adapter.
 

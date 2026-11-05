@@ -1,4 +1,4 @@
-use std::time::Duration;
+use std::{collections::HashMap, time::Duration};
 
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
@@ -157,12 +157,54 @@ pub struct HealthPoint {
 #[derive(Debug, Clone)]
 pub struct SourceView {
     pub name: String,
+    pub path_slug: String,
+    pub ingest_url: String,
     pub provider: String,
     pub allowed_ips: Vec<String>,
     pub audience: Option<String>,
     pub service_account: Option<String>,
+    pub provider_config: HashMap<String, String>,
+    pub credential_keys: Vec<String>,
     pub enabled: bool,
     pub secret_present: bool,
+}
+
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub struct DatabaseSourceResponse {
+    pub name: String,
+    pub path_slug: String,
+    pub provider: String,
+    pub ingest_path: String,
+    pub ingest_url: String,
+    pub allowed_ips: Vec<String>,
+    pub audience: Option<String>,
+    pub service_account: Option<String>,
+    pub provider_config: HashMap<String, String>,
+    pub credential_keys: Vec<String>,
+    pub enabled: bool,
+    pub secret_present: bool,
+}
+
+impl From<SourceView> for DatabaseSourceResponse {
+    fn from(source: SourceView) -> Self {
+        let ingest_path = format!("/in/{}", source.path_slug);
+        let base_url = std::env::var("PUBLIC_BASE_URL")
+            .unwrap_or_else(|_| "https://vant-way.up.railway.app".to_owned());
+        Self {
+            ingest_url: format!("{}{}", base_url.trim_end_matches('/'), ingest_path),
+            ingest_path,
+            name: source.name,
+            path_slug: source.path_slug,
+            provider: source.provider,
+            allowed_ips: source.allowed_ips,
+            audience: source.audience,
+            service_account: source.service_account,
+            provider_config: source.provider_config,
+            credential_keys: source.credential_keys,
+            enabled: source.enabled,
+            secret_present: source.secret_present,
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -284,6 +326,35 @@ fn mask_setting(value: &str) -> String {
         .unwrap_or_else(|| "••••".to_owned())
 }
 
+fn provider_credentials_from_env(source: &SourceConfig) -> HashMap<String, String> {
+    source
+        .provider_config
+        .iter()
+        .filter_map(|(key, env_name)| {
+            let credential_name = key.strip_suffix("_env")?;
+            let value = std::env::var(env_name).ok()?.trim().to_owned();
+            (!value.is_empty()).then_some((credential_name.to_owned(), value))
+        })
+        .collect()
+}
+
+fn decrypt_credentials(ciphertext: &str) -> HashMap<String, String> {
+    if ciphertext.is_empty() {
+        return HashMap::new();
+    }
+    decrypt(ciphertext)
+        .ok()
+        .and_then(|value| serde_json::from_str(&value).ok())
+        .unwrap_or_default()
+}
+
+fn encrypt_credentials(credentials: &HashMap<String, String>) -> Result<String> {
+    if credentials.is_empty() {
+        return Ok(String::new());
+    }
+    encrypt(&serde_json::to_string(credentials)?)
+}
+
 impl Database {
     pub async fn connect(url: &str) -> Result<Self> {
         let pool = PgPoolOptions::new()
@@ -314,11 +385,13 @@ impl Database {
         if source_count == 0 {
             for (name, source) in &config.source {
                 let secret = std::env::var(&source.secret_env).ok();
-                sqlx::query("INSERT INTO sources (id, name, provider, secret_ciphertext, allowed_ips, audience, service_account, provider_config, created_at, updated_at) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, now(), now())")
+                let credentials = provider_credentials_from_env(source);
+                sqlx::query("INSERT INTO sources (id, name, path_slug, provider, secret_ciphertext, credentials_ciphertext, allowed_ips, audience, service_account, provider_config, created_at, updated_at) VALUES ($1, $2, $2, $3, $4, $5, $6, $7, $8, $9, now(), now())")
                     .bind(Uuid::new_v4())
                     .bind(name)
                     .bind(&source.provider)
                     .bind(secret.map(|value| encrypt(&value)).transpose()?.unwrap_or_default())
+                    .bind(encrypt_credentials(&credentials)?)
                     .bind(serde_json::to_value(&source.allowed_ips)?)
                     .bind(&source.audience)
                     .bind(&source.service_account)
@@ -344,27 +417,70 @@ impl Database {
             }
         }
         tx.commit().await?;
+        self.bootstrap_legacy_source_credentials(config).await?;
+        Ok(())
+    }
+
+    async fn bootstrap_legacy_source_credentials(&self, config: &Config) -> Result<()> {
+        for (name, source) in &config.source {
+            let row = sqlx::query(
+                "SELECT secret_ciphertext, credentials_ciphertext FROM sources WHERE name = $1 OR path_slug = $1 LIMIT 1",
+            )
+            .bind(name)
+            .fetch_optional(&self.pool)
+            .await?;
+            let Some(row) = row else { continue };
+            let secret_ciphertext: String = row.try_get("secret_ciphertext")?;
+            let credentials_ciphertext: String = row.try_get("credentials_ciphertext")?;
+            let secret = if secret_ciphertext.is_empty() {
+                std::env::var(&source.secret_env)
+                    .ok()
+                    .filter(|value| !value.trim().is_empty())
+            } else {
+                None
+            };
+            let mut credentials = decrypt_credentials(&credentials_ciphertext);
+            let initial_credential_count = credentials.len();
+            for (key, value) in provider_credentials_from_env(source) {
+                credentials.entry(key).or_insert(value);
+            }
+            if secret.is_some() || credentials.len() != initial_credential_count {
+                sqlx::query("UPDATE sources SET secret_ciphertext = CASE WHEN secret_ciphertext = '' AND $2 IS NOT NULL THEN $2 ELSE secret_ciphertext END, credentials_ciphertext = $3, updated_at = now() WHERE name = $1 OR path_slug = $1")
+                    .bind(name)
+                    .bind(secret.map(|value| encrypt(&value)).transpose()?.unwrap_or_default())
+                    .bind(encrypt_credentials(&credentials)?)
+                    .execute(&self.pool)
+                    .await?;
+            }
+        }
         Ok(())
     }
 
     pub async fn load_runtime_config(
         &self,
         base: &Config,
-    ) -> (Config, std::collections::HashMap<String, String>) {
+    ) -> (
+        Config,
+        HashMap<String, String>,
+        HashMap<String, HashMap<String, String>>,
+    ) {
         let mut config = base.clone();
         let mut secrets = std::collections::HashMap::new();
-        let source_rows = sqlx::query("SELECT name, provider, secret_ciphertext, allowed_ips, audience, service_account, provider_config FROM sources WHERE enabled = true ORDER BY name")
+        let mut credentials = HashMap::new();
+        let source_rows = sqlx::query("SELECT name, path_slug, provider, secret_ciphertext, credentials_ciphertext, allowed_ips, audience, service_account, provider_config FROM sources WHERE enabled = true ORDER BY path_slug")
             .fetch_all(&self.pool)
             .await;
         if let Ok(rows) = source_rows
             && !rows.is_empty()
         {
+            let base_sources = config.source.clone();
             config.source.clear();
             for row in rows {
                 let name: String = match row.try_get("name") {
                     Ok(value) => value,
                     Err(_) => continue,
                 };
+                let path_slug: String = row.try_get("path_slug").unwrap_or_else(|_| name.clone());
                 let provider: String = match row.try_get("provider") {
                     Ok(value) => value,
                     Err(_) => continue,
@@ -373,6 +489,8 @@ impl Database {
                     Ok(value) => value,
                     Err(_) => continue,
                 };
+                let credentials_ciphertext: String =
+                    row.try_get("credentials_ciphertext").unwrap_or_default();
                 let allowed_ips = row
                     .try_get("allowed_ips")
                     .ok()
@@ -389,35 +507,28 @@ impl Database {
                     .and_then(|value| serde_json::from_value(value).ok())
                     .filter(|value: &std::collections::HashMap<String, String>| !value.is_empty())
                     .or_else(|| {
-                        config
-                            .source
+                        base_sources
                             .get(&name)
+                            .or_else(|| base_sources.get(&path_slug))
                             .map(|source| source.provider_config.clone())
                     })
                     .unwrap_or_default();
-                if let Ok(secret) = std::env::var(format!("{name}_SECRET_KEY")) {
-                    secrets.insert(name.clone(), secret);
-                } else if !ciphertext.is_empty() {
-                    if let Ok(secret) = decrypt(&ciphertext) {
-                        secrets.insert(name.clone(), secret);
-                    }
-                } else if let Ok(Some(secret)) =
-                    self.setting_value(&format!("{name}_SECRET_KEY")).await
+                if !ciphertext.is_empty()
+                    && let Ok(secret) = decrypt(&ciphertext)
                 {
-                    secrets.insert(name.clone(), secret);
-                } else if let Ok(Some(secret)) = self.setting_value("PAYSTACK_SECRET_KEY").await {
-                    secrets.insert(name.clone(), secret);
+                    secrets.insert(path_slug.clone(), secret);
                 }
-                let secret_env = if provider == "paystack" {
-                    "PAYSTACK_SECRET_KEY".to_owned()
-                } else {
-                    format!("{}_SECRET_KEY", name.to_ascii_uppercase())
-                };
+                credentials.insert(
+                    path_slug.clone(),
+                    decrypt_credentials(&credentials_ciphertext),
+                );
                 config.source.insert(
-                    name,
+                    path_slug,
                     SourceConfig {
                         provider,
-                        secret_env,
+                        // Enabled DB rows are authoritative. Legacy env names are
+                        // used by seed_runtime_config only, never by runtime reload.
+                        secret_env: String::new(),
                         allowed_ips,
                         audience,
                         service_account,
@@ -426,16 +537,7 @@ impl Database {
                 );
             }
         }
-        for (name, source) in &config.source {
-            if secrets.contains_key(name) {
-                continue;
-            }
-            if let Ok(secret) = std::env::var(&source.secret_env) {
-                secrets.insert(name.clone(), secret);
-            } else if let Ok(Some(secret)) = self.setting_value(&source.secret_env).await {
-                secrets.insert(name.clone(), secret);
-            }
-        }
+
         let route_rows = sqlx::query(
             "SELECT name, COALESCE(target_url, destination_url) AS destination_url, matcher, ref_prefix, metadata_app, app_identifier, environment FROM routes WHERE enabled = true ORDER BY name",
         )
@@ -517,7 +619,7 @@ impl Database {
                 }
             }
         }
-        (config, secrets)
+        (config, secrets, credentials)
     }
 
     pub async fn alert_url_setting(&self) -> Option<String> {
@@ -569,18 +671,36 @@ impl Database {
     }
 
     pub async fn list_sources(&self) -> Result<Vec<SourceView>> {
-        let rows = sqlx::query("SELECT name, provider, allowed_ips, audience, service_account, enabled, secret_ciphertext <> '' AS secret_present FROM sources ORDER BY name")
+        let rows = sqlx::query("SELECT name, path_slug, provider, allowed_ips, audience, service_account, provider_config, credentials_ciphertext, enabled, secret_ciphertext <> '' AS secret_present FROM sources ORDER BY path_slug")
             .fetch_all(&self.pool)
             .await?;
         rows.into_iter()
             .map(|row| {
                 let allowed: Value = row.try_get("allowed_ips")?;
+                let provider_config = row
+                    .try_get::<Value, _>("provider_config")
+                    .ok()
+                    .and_then(|value| serde_json::from_value(value).ok())
+                    .unwrap_or_default();
+                let credentials = decrypt_credentials(
+                    &row.try_get::<String, _>("credentials_ciphertext")
+                        .unwrap_or_default(),
+                );
                 Ok(SourceView {
                     name: row.try_get("name")?,
+                    path_slug: row.try_get("path_slug")?,
+                    ingest_url: {
+                        let path_slug: String = row.try_get("path_slug")?;
+                        let base_url = std::env::var("PUBLIC_BASE_URL")
+                            .unwrap_or_else(|_| "https://vant-way.up.railway.app".to_owned());
+                        format!("{}{}{}", base_url.trim_end_matches('/'), "/in/", path_slug)
+                    },
                     provider: row.try_get("provider")?,
                     allowed_ips: serde_json::from_value::<Vec<String>>(allowed).unwrap_or_default(),
                     audience: row.try_get("audience")?,
                     service_account: row.try_get("service_account")?,
+                    provider_config,
+                    credential_keys: credentials.into_keys().collect(),
                     enabled: row.try_get("enabled")?,
                     secret_present: row.try_get("secret_present")?,
                 })
@@ -1028,27 +1148,62 @@ impl Database {
     #[allow(clippy::too_many_arguments)]
     pub async fn save_source(
         &self,
+        current_path_slug: Option<&str>,
         name: &str,
+        path_slug: &str,
         provider: &str,
         secret: Option<&str>,
         allowed_ips: &[String],
         audience: Option<&str>,
         service_account: Option<&str>,
+        provider_config: Option<&HashMap<String, String>>,
+        credentials: Option<&HashMap<String, String>>,
         enabled: bool,
     ) -> Result<()> {
         let ciphertext = secret.map(encrypt).transpose()?;
-        sqlx::query("INSERT INTO sources (id, name, provider, secret_ciphertext, allowed_ips, audience, service_account, enabled, created_at, updated_at) VALUES ($1, $2, $3, COALESCE($4, ''), $5, $6, $7, $8, now(), now()) ON CONFLICT (name) DO UPDATE SET provider = EXCLUDED.provider, secret_ciphertext = CASE WHEN $4 IS NULL THEN sources.secret_ciphertext ELSE EXCLUDED.secret_ciphertext END, allowed_ips = EXCLUDED.allowed_ips, audience = EXCLUDED.audience, service_account = EXCLUDED.service_account, enabled = EXCLUDED.enabled, updated_at = now()")
-            .bind(Uuid::new_v4())
-            .bind(name)
-            .bind(provider)
-            .bind(ciphertext)
-            .bind(serde_json::to_value(allowed_ips)?)
-            .bind(audience)
-            .bind(service_account)
-            .bind(enabled)
+        let credentials_ciphertext = credentials.map(encrypt_credentials).transpose()?;
+        let provider_config_json = provider_config.map(serde_json::to_value).transpose()?;
+        if let Some(current_path_slug) = current_path_slug {
+            let result = sqlx::query("UPDATE sources SET name = $2, path_slug = $3, provider = $4, secret_ciphertext = CASE WHEN $5 IS NULL THEN secret_ciphertext ELSE $5 END, credentials_ciphertext = CASE WHEN $6 IS NULL THEN credentials_ciphertext ELSE $6 END, allowed_ips = $7, audience = $8, service_account = $9, provider_config = CASE WHEN $10 IS NULL THEN provider_config ELSE $10 END, enabled = $11, updated_at = now() WHERE path_slug = $1")
+                .bind(current_path_slug)
+                .bind(name)
+                .bind(path_slug)
+                .bind(provider)
+                .bind(ciphertext)
+                .bind(credentials_ciphertext)
+                .bind(serde_json::to_value(allowed_ips)?)
+                .bind(audience)
+                .bind(service_account)
+                .bind(provider_config_json)
+                .bind(enabled)
+                .execute(&self.pool)
+                .await?;
+            anyhow::ensure!(result.rows_affected() == 1, "source not found");
+        } else {
+            sqlx::query("INSERT INTO sources (id, name, path_slug, provider, secret_ciphertext, credentials_ciphertext, allowed_ips, audience, service_account, provider_config, enabled, created_at, updated_at) VALUES ($1, $2, $3, $4, COALESCE($5, ''), COALESCE($6, ''), $7, $8, $9, COALESCE($10, '{}'::jsonb), $11, now(), now())")
+                .bind(Uuid::new_v4())
+                .bind(name)
+                .bind(path_slug)
+                .bind(provider)
+                .bind(ciphertext)
+                .bind(credentials_ciphertext)
+                .bind(serde_json::to_value(allowed_ips)?)
+                .bind(audience)
+                .bind(service_account)
+                .bind(provider_config_json)
+                .bind(enabled)
+                .execute(&self.pool)
+                .await?;
+        }
+        Ok(())
+    }
+
+    pub async fn delete_source(&self, path_slug: &str) -> Result<bool> {
+        let result = sqlx::query("DELETE FROM sources WHERE path_slug = $1")
+            .bind(path_slug)
             .execute(&self.pool)
             .await?;
-        Ok(())
+        Ok(result.rows_affected() > 0)
     }
 
     pub async fn user_count(&self) -> Result<i64> {

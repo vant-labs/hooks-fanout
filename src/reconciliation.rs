@@ -23,6 +23,7 @@ pub async fn reconcile_once(state: &AppState) -> anyhow::Result<()> {
     state.refresh_runtime_if_stale().await;
     let config = state.runtime_config.read().await.clone();
     let secrets = state.runtime_secrets.read().await.clone();
+    let credentials = state.runtime_credentials.read().await.clone();
     for provider_name in ["apple_server_notifications", "google_play_rtdn"] {
         let Some((source_name, source)) = config
             .source
@@ -39,7 +40,8 @@ pub async fn reconcile_once(state: &AppState) -> anyhow::Result<()> {
             .cloned()
             .or_else(|| config.secret_for(source_name).ok())
             .unwrap_or_default();
-        let runtime = resolve_provider_runtime(source, &secret);
+        let source_credentials = credentials.get(source_name).cloned().unwrap_or_default();
+        let runtime = resolve_provider_runtime(source, &secret, &source_credentials);
         let purchases = state
             .db
             .list_reconciliation_purchases(if provider_name.starts_with("apple") {

@@ -26,8 +26,8 @@ use uuid::Uuid;
 use crate::{
     config::{Config, ExtendedRouteMatcher, RouteConfig as ConfigRoute},
     db::{
-        Database, DatabaseRoute, DatabaseRouteRecord, DatabaseRouteResponse, InsertResult,
-        PurchaseApplyResult,
+        Database, DatabaseRoute, DatabaseRouteRecord, DatabaseRouteResponse,
+        DatabaseSourceResponse, InsertResult, PurchaseApplyResult,
     },
     metrics::Metrics,
     provider::{
@@ -57,6 +57,7 @@ pub struct AppState {
     pub login_limits: Arc<std::sync::Mutex<HashMap<String, (u32, Instant)>>>,
     pub runtime_config: Arc<tokio::sync::RwLock<Config>>,
     pub runtime_secrets: Arc<tokio::sync::RwLock<HashMap<String, String>>>,
+    pub runtime_credentials: Arc<tokio::sync::RwLock<HashMap<String, HashMap<String, String>>>>,
     pub runtime_alert_url: Arc<tokio::sync::RwLock<Option<String>>>,
     pub runtime_loaded_at: Arc<tokio::sync::RwLock<Instant>>,
     pub route_cache: Arc<tokio::sync::RwLock<RouteCache>>,
@@ -104,6 +105,7 @@ impl AppState {
             login_limits: Arc::new(std::sync::Mutex::new(HashMap::new())),
             runtime_config: Arc::new(tokio::sync::RwLock::new(runtime_config)),
             runtime_secrets: Arc::new(tokio::sync::RwLock::new(HashMap::new())),
+            runtime_credentials: Arc::new(tokio::sync::RwLock::new(HashMap::new())),
             runtime_alert_url: Arc::new(tokio::sync::RwLock::new(None)),
             runtime_loaded_at: Arc::new(tokio::sync::RwLock::new(Instant::now())),
             route_cache: Arc::new(tokio::sync::RwLock::new(None)),
@@ -112,9 +114,10 @@ impl AppState {
     }
 
     pub async fn reload_runtime_config(&self) -> anyhow::Result<()> {
-        let (config, secrets) = self.db.load_runtime_config(&self.config).await;
+        let (config, secrets, credentials) = self.db.load_runtime_config(&self.config).await;
         *self.runtime_config.write().await = config;
         *self.runtime_secrets.write().await = secrets;
+        *self.runtime_credentials.write().await = credentials;
         *self.runtime_alert_url.write().await = self.db.alert_url_setting().await;
         *self.runtime_loaded_at.write().await = Instant::now();
         Ok(())
@@ -217,6 +220,14 @@ pub fn build_router(state: Arc<AppState>) -> Router {
             "/admin/routes/{name}",
             patch(update_admin_route).delete(delete_admin_route),
         )
+        .route(
+            "/admin/sources",
+            get(list_admin_sources).post(create_admin_source),
+        )
+        .route(
+            "/admin/sources/{path_slug}",
+            patch(update_admin_source).delete(delete_admin_source),
+        )
         .route("/admin/deliveries", get(list_admin_deliveries))
         .route("/admin/settings", get(list_admin_settings))
         .route(
@@ -264,14 +275,16 @@ impl ResolvedProviderRuntime {
 pub(crate) fn resolve_provider_runtime(
     source: &crate::config::SourceConfig,
     secret: &str,
+    credentials: &HashMap<String, String>,
 ) -> ResolvedProviderRuntime {
     let value = |key: &str| source.provider_config.get(key).cloned();
     let env_value = |key: &str| {
-        source
-            .provider_config
-            .get(key)
+        (!source.secret_env.is_empty())
+            .then(|| source.provider_config.get(key))
+            .flatten()
             .and_then(|name| std::env::var(name).ok())
     };
+    let credential = |key: &str| credentials.get(key).cloned();
     let mut product_licences = HashMap::new();
     for (key, value) in &source.provider_config {
         if let Some(product) = key.strip_prefix("product_licence.") {
@@ -283,11 +296,17 @@ pub(crate) fn resolve_provider_runtime(
         environment: value("environment"),
         api_base_url: value("api_base_url"),
         token_url: value("token_url"),
-        key_id: value("key_id").or_else(|| env_value("key_id_env")),
-        issuer_id: value("issuer_id").or_else(|| env_value("issuer_id_env")),
-        private_key: env_value("private_key_env")
+        key_id: value("key_id")
+            .or_else(|| credential("key_id"))
+            .or_else(|| env_value("key_id_env")),
+        issuer_id: value("issuer_id")
+            .or_else(|| credential("issuer_id"))
+            .or_else(|| env_value("issuer_id_env")),
+        private_key: credential("private_key")
+            .or_else(|| env_value("private_key_env"))
             .or_else(|| (!secret.is_empty()).then(|| secret.to_owned())),
-        service_account_key: env_value("service_account_key_env")
+        service_account_key: credential("service_account_key")
+            .or_else(|| env_value("service_account_key_env"))
             .or_else(|| (!secret.is_empty()).then(|| secret.to_owned())),
         product_licences,
     }
@@ -318,6 +337,7 @@ pub(crate) async fn ingest(
     state.refresh_runtime_if_stale().await;
     let active_config = state.runtime_config.read().await.clone();
     let active_secrets = state.runtime_secrets.read().await.clone();
+    let active_credentials = state.runtime_credentials.read().await.clone();
     let Some(source_config) = active_config.source.get(&source) else {
         return StatusCode::NOT_FOUND.into_response();
     };
@@ -382,7 +402,11 @@ pub(crate) async fn ingest(
             return StatusCode::BAD_REQUEST.into_response();
         }
     };
-    let provider_runtime = resolve_provider_runtime(source_config, &secret);
+    let provider_runtime = resolve_provider_runtime(
+        source_config,
+        &secret,
+        &active_credentials.get(&source).cloned().unwrap_or_default(),
+    );
     let initial_normalized = provider.normalize_event_with_settings(
         &payload,
         &body,
@@ -706,7 +730,14 @@ pub(crate) async fn verify_purchase(
         .cloned()
         .or_else(|| active_config.secret_for(source_name).ok())
         .unwrap_or_default();
-    let runtime = resolve_provider_runtime(source_config, &secret);
+    let credentials = state
+        .runtime_credentials
+        .read()
+        .await
+        .get(source_name)
+        .cloned()
+        .unwrap_or_default();
+    let runtime = resolve_provider_runtime(source_config, &secret, &credentials);
     let receipt = body
         .receipt
         .or(body.purchase_token)
@@ -1000,9 +1031,9 @@ pub(crate) async fn readyz(State(state): State<Arc<AppState>>) -> impl IntoRespo
         .filter(|(name, source)| {
             provider_for(&source.provider).is_none_or(Provider::secret_required)
                 && !secrets.contains_key(*name)
-                && std::env::var(&source.secret_env).is_err()
+                && (source.secret_env.is_empty() || std::env::var(&source.secret_env).is_err())
         })
-        .map(|(_, source)| source.secret_env.clone())
+        .map(|(name, _)| name.clone())
         .collect::<Vec<_>>();
     if missing.is_empty() {
         (StatusCode::OK, Json(json!({"status": "ready"})))
@@ -1192,6 +1223,341 @@ pub(crate) async fn bulk_replay(
         Ok(count) => Json(json!({"requeued": count})).into_response(),
         Err(error) => {
             tracing::error!(error = %error, "bulk replay failed");
+            StatusCode::INTERNAL_SERVER_ERROR.into_response()
+        }
+    }
+}
+
+#[derive(Debug, Deserialize, ToSchema)]
+pub(crate) struct SourceWriteBody {
+    pub name: Option<String>,
+    pub path_slug: Option<String>,
+    pub provider: Option<String>,
+    pub secret: Option<String>,
+    pub allowed_ips: Option<Vec<String>>,
+    pub audience: Option<String>,
+    pub service_account: Option<String>,
+    pub provider_config: Option<HashMap<String, String>>,
+    pub credentials: Option<HashMap<String, String>>,
+    pub enabled: Option<bool>,
+}
+
+pub(crate) fn valid_source_slug(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 80
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+}
+
+fn normalized_source_value(value: Option<String>) -> Option<String> {
+    value
+        .map(|value| value.trim().to_owned())
+        .filter(|value| !value.is_empty())
+}
+
+fn source_allowed_ips(values: Option<Vec<String>>) -> Result<Vec<String>, String> {
+    values
+        .unwrap_or_default()
+        .into_iter()
+        .map(|value| {
+            let value = value.trim().to_owned();
+            value
+                .parse::<IpAddr>()
+                .map(|_| value.clone())
+                .map_err(|_| format!("invalid source IP: {value}"))
+        })
+        .collect()
+}
+
+fn valid_source_provider_settings(
+    provider: &str,
+    audience: Option<&str>,
+    service_account: Option<&str>,
+) -> bool {
+    provider != "google_play_rtdn"
+        || (audience.is_some_and(|value| !value.is_empty())
+            && service_account.is_some_and(|value| !value.is_empty()))
+}
+
+#[utoipa::path(
+    get,
+    path = "/admin/sources",
+    responses((status = 200, description = "Configured sources", body = [crate::db::DatabaseSourceResponse])),
+    security(("admin_bearer" = [])),
+    tag = "Admin API"
+)]
+pub(crate) async fn list_admin_sources(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+) -> Response {
+    if !api_authorized(&state, &headers, false).await {
+        return StatusCode::UNAUTHORIZED.into_response();
+    }
+    match state.db.list_sources().await {
+        Ok(sources) => Json(
+            sources
+                .into_iter()
+                .map(DatabaseSourceResponse::from)
+                .collect::<Vec<_>>(),
+        )
+        .into_response(),
+        Err(error) => {
+            tracing::error!(error = %error, "listing sources failed");
+            StatusCode::INTERNAL_SERVER_ERROR.into_response()
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn save_api_source(
+    state: &AppState,
+    current_path_slug: Option<&str>,
+    name: &str,
+    path_slug: &str,
+    provider: &str,
+    secret: Option<&str>,
+    allowed_ips: &[String],
+    audience: Option<&str>,
+    service_account: Option<&str>,
+    provider_config: Option<&HashMap<String, String>>,
+    credentials: Option<&HashMap<String, String>>,
+    enabled: bool,
+) -> Result<(), (StatusCode, String)> {
+    if name.is_empty() || !valid_source_slug(path_slug) {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "name and a path_slug containing only letters, numbers, - or _ are required".to_owned(),
+        ));
+    }
+    if !crate::provider::supported_providers().contains(&provider) {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "provider is not supported".to_owned(),
+        ));
+    }
+    if !valid_source_provider_settings(provider, audience, service_account) {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "Google Play sources require audience and service_account".to_owned(),
+        ));
+    }
+    state
+        .db
+        .save_source(
+            current_path_slug,
+            name,
+            path_slug,
+            provider,
+            secret,
+            allowed_ips,
+            audience,
+            service_account,
+            provider_config,
+            credentials,
+            enabled,
+        )
+        .await
+        .map_err(|error| (StatusCode::BAD_REQUEST, error.to_string()))
+}
+
+#[utoipa::path(
+    post,
+    path = "/admin/sources",
+    request_body = SourceWriteBody,
+    responses((status = 201, description = "Source created", body = crate::db::DatabaseSourceResponse)),
+    security(("admin_bearer" = [])),
+    tag = "Admin API"
+)]
+pub(crate) async fn create_admin_source(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Json(body): Json<SourceWriteBody>,
+) -> Response {
+    if !api_authorized(&state, &headers, true).await {
+        return StatusCode::UNAUTHORIZED.into_response();
+    }
+    let Some(name) = body
+        .name
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    else {
+        return (StatusCode::BAD_REQUEST, "name is required").into_response();
+    };
+    let path_slug = body
+        .path_slug
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or(name);
+    let Some(provider) = body
+        .provider
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    else {
+        return (StatusCode::BAD_REQUEST, "provider is required").into_response();
+    };
+    let allowed_ips = match source_allowed_ips(body.allowed_ips) {
+        Ok(values) => values,
+        Err(error) => return (StatusCode::BAD_REQUEST, error).into_response(),
+    };
+    let audience = normalized_source_value(body.audience);
+    let service_account = normalized_source_value(body.service_account);
+    let secret = normalized_source_value(body.secret);
+    let error = save_api_source(
+        &state,
+        None,
+        name,
+        path_slug,
+        provider,
+        secret.as_deref(),
+        &allowed_ips,
+        audience.as_deref(),
+        service_account.as_deref(),
+        body.provider_config.as_ref(),
+        body.credentials.as_ref(),
+        body.enabled.unwrap_or(true),
+    )
+    .await
+    .err();
+    if let Some((status, message)) = error {
+        return (status, message).into_response();
+    }
+    if let Err(error) = state.reload_runtime_config().await {
+        tracing::error!(error = %error, "reloading source configuration failed");
+        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+    }
+    match state.db.list_sources().await.ok().and_then(|sources| {
+        sources
+            .into_iter()
+            .find(|source| source.path_slug == path_slug)
+    }) {
+        Some(source) => (
+            StatusCode::CREATED,
+            Json(DatabaseSourceResponse::from(source)),
+        )
+            .into_response(),
+        None => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+    }
+}
+
+#[utoipa::path(
+    patch,
+    path = "/admin/sources/{path_slug}",
+    params(("path_slug" = String, Path, description = "Source path slug")),
+    request_body = SourceWriteBody,
+    responses((status = 200, description = "Source updated", body = crate::db::DatabaseSourceResponse)),
+    security(("admin_bearer" = [])),
+    tag = "Admin API"
+)]
+pub(crate) async fn update_admin_source(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Path(path_slug): Path<String>,
+    Json(body): Json<SourceWriteBody>,
+) -> Response {
+    if !api_authorized(&state, &headers, true).await {
+        return StatusCode::UNAUTHORIZED.into_response();
+    }
+    let source = match state.db.list_sources().await {
+        Ok(sources) => sources
+            .into_iter()
+            .find(|source| source.path_slug == path_slug),
+        Err(error) => {
+            return {
+                tracing::error!(error = %error, "loading source failed");
+                StatusCode::INTERNAL_SERVER_ERROR.into_response()
+            };
+        }
+    };
+    let Some(source) = source else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    let name = body
+        .name
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or(&source.name);
+    let new_path_slug = body
+        .path_slug
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or(&source.path_slug);
+    let provider = body
+        .provider
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or(&source.provider);
+    let allowed_ips =
+        match source_allowed_ips(body.allowed_ips.or(Some(source.allowed_ips.clone()))) {
+            Ok(values) => values,
+            Err(error) => return (StatusCode::BAD_REQUEST, error).into_response(),
+        };
+    let audience = normalized_source_value(body.audience).or(source.audience.clone());
+    let service_account =
+        normalized_source_value(body.service_account).or(source.service_account.clone());
+    let secret = normalized_source_value(body.secret);
+    let error = save_api_source(
+        &state,
+        Some(&source.path_slug),
+        name,
+        new_path_slug,
+        provider,
+        secret.as_deref(),
+        &allowed_ips,
+        audience.as_deref(),
+        service_account.as_deref(),
+        body.provider_config.as_ref(),
+        body.credentials.as_ref(),
+        body.enabled.unwrap_or(source.enabled),
+    )
+    .await;
+    if let Err((status, message)) = error {
+        return (status, message).into_response();
+    }
+    if let Err(error) = state.reload_runtime_config().await {
+        tracing::error!(error = %error, "reloading source configuration failed");
+        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+    }
+    match state.db.list_sources().await.ok().and_then(|sources| {
+        sources
+            .into_iter()
+            .find(|source| source.path_slug == new_path_slug)
+    }) {
+        Some(source) => Json(DatabaseSourceResponse::from(source)).into_response(),
+        None => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+    }
+}
+
+#[utoipa::path(
+    delete,
+    path = "/admin/sources/{path_slug}",
+    params(("path_slug" = String, Path, description = "Source path slug")),
+    responses((status = 204, description = "Source deleted")),
+    security(("admin_bearer" = [])),
+    tag = "Admin API"
+)]
+pub(crate) async fn delete_admin_source(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Path(path_slug): Path<String>,
+) -> Response {
+    if !api_authorized(&state, &headers, true).await {
+        return StatusCode::UNAUTHORIZED.into_response();
+    }
+    match state.db.delete_source(&path_slug).await {
+        Ok(true) => {
+            let _ = state.reload_runtime_config().await;
+            StatusCode::NO_CONTENT.into_response()
+        }
+        Ok(false) => StatusCode::NOT_FOUND.into_response(),
+        Err(error) => {
+            tracing::error!(error = %error, "deleting source failed");
             StatusCode::INTERNAL_SERVER_ERROR.into_response()
         }
     }

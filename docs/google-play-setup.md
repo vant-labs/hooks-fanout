@@ -13,23 +13,34 @@ feeds the result into the existing fanout event and entitlement path.
 - A service-account JSON key stored in a secret, never in the repository.
 - A product-to-licence mapping in the source configuration.
 - An HTTPS push endpoint such as
-  `https://your-host/in/google_production`.
+  `https://vant-way.up.railway.app/in/google_production`.
 
 ## Production source
 
-Add a source in the dashboard or use the first-boot configuration seed:
+In the dashboard, open Sources → Add source and enter:
+
+- Name: `Google production`
+- Path slug: `google_production`
+- Provider: `google_play_rtdn`
+- Audience: `https://vant-way.up.railway.app/in/google_production`
+- Push service account: the Pub/Sub service-account email
+- Provider settings: the package name, environment, and product/licence map
+- Encrypted credentials: the service-account JSON under `service_account_key`
+
+The resulting paste URL is `https://vant-way.up.railway.app/in/google_production`.
+This writes the source to Postgres and does not require a redeploy. The
+first-boot configuration seed remains available for local setup:
 
 ```toml
 [source.google_production]
 provider = "google_play_rtdn"
 audience = "https://your-host/in/google_production"
 service_account = "pubsub-push@your-project.iam.gserviceaccount.com"
-secret_env = "GOOGLE_SERVICE_ACCOUNT_JSON"
 
 [source.google_production.provider_config]
 app_identifier = "com.example.timamu"
 environment = "production"
-service_account_key_env = "GOOGLE_SERVICE_ACCOUNT_JSON"
+service_account_key_env = "GOOGLE_SERVICE_ACCOUNT_JSON" # legacy first-boot import
 "product_licence.timamu_monthly" = "timamu_pro"
 ```
 
@@ -50,7 +61,8 @@ production. A production source rejects Google test purchases.
 5. Set the push service account to the email in `service_account`.
 6. Configure the topic in Play Console under Monetize with Google Play →
    Monetization setup → Real-time developer notifications.
-7. Configure a route matching the package name in `app_identifier`.
+7. Configure a route matching the package name in `app_identifier` and set
+   `environment = "production"`.
 
 RTDN envelopes are deduplicated using the Pub/Sub `messageId`. The adapter
 decodes the notification, looks up the current subscription or product state,

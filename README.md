@@ -80,10 +80,20 @@ development; production keeps secure cookies enabled by default.
 `FANOUT_CONFIG` is optional and is used only as a first-boot seed. If it is
 unset or missing, the service starts with a Paystack source named
 `paystack_main`, no routes, and the default 45-day retention. Routes and
-sources are then managed in the dashboard and stored in Postgres. Secret
-values are never read directly from the file; `secret_env` names the
-environment variable that holds the value. Start local development from
+sources are then managed in the dashboard and stored in Postgres. Source
+secrets and provider credentials are encrypted in Postgres; `secret_env` and
+`*_env` settings are legacy first-boot bootstrap names and are not required
+for runtime reloads. Start local development from
 [config.example.toml](config.example.toml).
+
+The dashboard’s Sources panel creates, edits, and disables ingress sources.
+Each source has an explicit path slug and displays the paste URL
+`https://your-host/in/{slug}`. The same operations are available through
+`GET/POST /admin/sources` and `PATCH/DELETE /admin/sources/{slug}`. Routes
+remain managed by the existing `/dashboard/config` page and
+`GET/POST /admin/routes`, `PATCH/DELETE /admin/routes/{name}` APIs.
+Set `PUBLIC_BASE_URL` when the dashboard should render a host other than the
+default `https://vant-way.up.railway.app`.
 
 ```toml
 [source.paystack_main]
@@ -103,7 +113,7 @@ mode = "unrouted"
 `allowed_ips = []` disables the allowlist for that source. `TRUST_PROXY=true`
 allows the first address in `X-Forwarded-For` to be checked; otherwise the TCP
 peer address is used. The request body limit is 256 KiB. `RETENTION_DAYS`
-defaults to 45 and cannot exceed 45 days; delivery records are kept for 30 days
+defaults to 45 days; delivery records are kept for 30 days
 and delivered event records follow the configured retention.
 
 ### Store provider setup
@@ -159,10 +169,12 @@ Clients must read `GET /v1/entitlements` with the same bearer token. They must
 not grant access from a local receipt or token check. Set `PURCHASE_JWT_SECRET`
 for HS256 account JWTs, or use `PURCHASE_BEARER_TOKEN` together with
 `PURCHASE_BEARER_ACCOUNT_ID` for a static account-bound bearer identity.
-Configure store sources with `provider_config` mappings such as
-`app_identifier`, `environment`, `api_base_url` (for a test server), and
-`product_licence.<product-id>`. Key and service-account settings use `*_env`
-names and are resolved from secrets at runtime.
+Configure store sources from the Sources panel with non-secret
+`provider_config` mappings such as `app_identifier`, `environment`,
+`api_base_url` (for a test server), and `product_licence.<product-id>`. Put
+`key_id`, `issuer_id`, `private_key`, or `service_account_key` in the encrypted
+credentials JSON field. Existing `*_env` names are imported once at startup
+when the corresponding DB value is absent and are then deprecated.
 
 An alert destination may be enabled with:
 
@@ -311,8 +323,13 @@ OpenAPI document at `/api-docs/openapi.json`.
 5. Run `POST /admin/bootstrap` with the bootstrap bearer token and your email
    and password after the first deploy, then enable 2FA.
 6. Use the service public URL as the Paystack webhook URL in test mode.
-7. Add routes and sources from the dashboard; do not deploy a production route
-   file.
+7. In Sources, create `google_production`, `apple_production`, and
+   `apple_sandbox` with their provider settings and encrypted credentials; the
+   paste URLs are `https://vant-way.up.railway.app/in/google_production`,
+   `https://vant-way.up.railway.app/in/apple_production`, and
+   `https://vant-way.up.railway.app/in/apple_sandbox` for the current service.
+8. Add routes and additional sources from the dashboard; no production route
+   file or redeploy is required.
 
 ## Rollout guide
 
