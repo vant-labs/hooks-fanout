@@ -356,7 +356,7 @@ Pages are available after signing in:
 | Role | Read | Replay/retry | Edit routes and export | Manage users | Manage sources/secrets |
 | --- | --- | --- | --- | --- | --- |
 | Viewer | Yes | No | No | No | No |
-| Admin | Yes | Yes | Yes | Yes | No |
+| Admin | Yes | Yes | Yes | Yes | Yes |
 | Owner | Yes | Yes | Yes | Yes | Yes |
 
 The JSON admin API remains available with `Authorization: Bearer $ADMIN_TOKEN`.

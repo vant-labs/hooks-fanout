@@ -212,6 +212,48 @@ async fn admin_can_manage_users() {
 
 #[tokio::test]
 #[serial]
+async fn admin_can_manage_sources_from_configuration() {
+    if !can_run() {
+        return;
+    }
+    let (state, db) = setup().await;
+    db.create_owner(
+        "owner@example.com",
+        &hash_password("long secure password").unwrap(),
+    )
+    .await
+    .unwrap();
+    db.create_user(
+        "admin@example.com",
+        &hash_password("long secure password").unwrap(),
+        Role::Admin,
+    )
+    .await
+    .unwrap();
+    let (cookie, csrf) = login(state.clone(), "admin@example.com", "long secure password").await;
+    let slug = format!("admin-source-{}", Uuid::new_v4());
+    let response = request(
+        state.clone(),
+        "POST",
+        "/dashboard/config/source",
+        Some(&cookie),
+        Some(&format!(
+            "csrf={csrf}&name=Admin+source&path_slug={slug}&provider=apple_server_notifications&provider_config=%7B%7D&enabled=on"
+        )),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::SEE_OTHER);
+    assert!(
+        db.list_sources()
+            .await
+            .unwrap()
+            .iter()
+            .any(|source| source.path_slug == slug)
+    );
+}
+
+#[tokio::test]
+#[serial]
 async fn repeated_bad_logins_are_limited() {
     if !can_run() {
         return;

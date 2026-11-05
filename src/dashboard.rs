@@ -1302,8 +1302,8 @@ async fn save_source(
     let Some(user) = require_user(&state, &headers).await else {
         return Redirect::to("/login").into_response();
     };
-    if !user.role.can_manage() || !csrf_matches(&user.csrf_token, Some(&form.csrf)) {
-        return (StatusCode::FORBIDDEN, "Owner access is required").into_response();
+    if !user.can_write || !csrf_matches(&user.csrf_token, Some(&form.csrf)) {
+        return (StatusCode::FORBIDDEN, "Admin or owner access is required").into_response();
     }
     let name = form.name.trim();
     let path_slug = form.path_slug.trim();
