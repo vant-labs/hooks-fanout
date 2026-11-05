@@ -331,6 +331,18 @@ OpenAPI document at `/api-docs/openapi.json`.
 8. Add routes and additional sources from the dashboard; no production route
    file or redeploy is required.
 
+### Temporary Google RTDN authentication diagnostics
+
+For a short-lived Google RTDN troubleshooting session only, set
+`FANOUT_DEBUG_AUTH=1` on the Railway service, send one test notification, and
+inspect the service logs. The extra Google-only diagnostic entry reports the
+authorization scheme, selected JWT header and payload claims, JWKS URL/fetch
+result, key-ID lookup, and verification step. It never logs the bearer value,
+JWT signature segment, or provider secret.
+
+After the test, unset `FANOUT_DEBUG_AUTH` and remove this temporary diagnostic
+path in a follow-up change.
+
 ## Rollout guide
 
 1. Deploy and point the Paystack TEST mode webhook at
