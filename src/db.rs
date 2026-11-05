@@ -62,6 +62,8 @@ pub struct EventDetail {
     pub raw_body: String,
     pub headers: Value,
     pub route_destination_url: Option<String>,
+    pub request_method: Option<String>,
+    pub request_url: Option<String>,
     pub routing_reason: Option<String>,
     pub attempts: Vec<AttemptView>,
 }
@@ -1558,13 +1560,52 @@ impl Database {
         status: &str,
         destination_url: Option<&str>,
     ) -> Result<InsertResult> {
+        self.insert_event_with_provider_event_id_and_normalized_with_request(
+            source,
+            event_type,
+            raw_body,
+            normalized_body,
+            content_type,
+            signature,
+            headers,
+            dedupe_key,
+            provider_event_id,
+            matched_route,
+            routing_reason,
+            status,
+            destination_url,
+            None,
+            None,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub async fn insert_event_with_provider_event_id_and_normalized_with_request(
+        &self,
+        source: &str,
+        event_type: &str,
+        raw_body: &[u8],
+        normalized_body: Option<&[u8]>,
+        content_type: &str,
+        signature: &str,
+        headers: &Value,
+        dedupe_key: &str,
+        provider_event_id: &str,
+        matched_route: Option<&str>,
+        routing_reason: Option<&str>,
+        status: &str,
+        destination_url: Option<&str>,
+        request_method: Option<&str>,
+        request_url: Option<&str>,
+    ) -> Result<InsertResult> {
         let event_id = Uuid::new_v4();
         let delivery_id = Uuid::new_v4();
         let now = Utc::now();
         let mut tx = self.pool.begin().await?;
         let inserted = sqlx::query(
-            r#"INSERT INTO events (id, source, event_type, raw_body, normalized_body, content_type, signature, headers, dedupe_key, provider_event_id, matched_route, routing_reason, status, received_at)
-               VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14) ON CONFLICT (source, dedupe_key) DO NOTHING"#,
+            r#"INSERT INTO events (id, source, event_type, raw_body, normalized_body, content_type, signature, headers, dedupe_key, provider_event_id, matched_route, routing_reason, status, received_at, request_method, request_url)
+               VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16) ON CONFLICT (source, dedupe_key) DO NOTHING"#,
         )
         .bind(event_id)
         .bind(source)
@@ -1580,6 +1621,8 @@ impl Database {
         .bind(routing_reason)
         .bind(status)
         .bind(now)
+        .bind(request_method)
+        .bind(request_url)
         .execute(&mut *tx)
         .await?;
         if inserted.rows_affected() == 0 {
@@ -1951,7 +1994,7 @@ impl Database {
     }
 
     pub async fn get_event(&self, event_id: Uuid) -> Result<Option<EventDetail>> {
-        let Some(row) = sqlx::query("SELECT e.id, e.source, e.event_type, e.raw_body, e.headers, d.destination_url AS route_destination_url, e.routing_reason, e.matched_route, e.status, e.received_at, e.delivered_at FROM events e LEFT JOIN deliveries d ON d.event_id = e.id WHERE e.id = $1").bind(event_id).fetch_optional(&self.pool).await? else { return Ok(None) };
+        let Some(row) = sqlx::query("SELECT e.id, e.source, e.event_type, e.raw_body, e.headers, e.request_method, e.request_url, d.destination_url AS route_destination_url, e.routing_reason, e.matched_route, e.status, e.received_at, e.delivered_at FROM events e LEFT JOIN deliveries d ON d.event_id = e.id WHERE e.id = $1").bind(event_id).fetch_optional(&self.pool).await? else { return Ok(None) };
         let summary = EventSummary {
             id: row.try_get("id")?,
             source: row.try_get("source")?,
@@ -1964,6 +2007,8 @@ impl Database {
         let raw_body: Vec<u8> = row.try_get("raw_body")?;
         let headers = mask_sensitive_headers(&row.try_get::<Value, _>("headers")?);
         let route_destination_url = row.try_get("route_destination_url")?;
+        let request_method = row.try_get("request_method")?;
+        let request_url = row.try_get("request_url")?;
         let routing_reason: Option<String> = row.try_get("routing_reason")?;
         let rows = sqlx::query("SELECT da.attempt, da.started_at, da.finished_at, da.status_code, da.latency_ms, da.response_body, da.error FROM delivery_attempts da JOIN deliveries d ON d.id = da.delivery_id WHERE d.event_id = $1 ORDER BY da.attempt").bind(event_id).fetch_all(&self.pool).await?;
         let attempts = rows
@@ -1985,6 +2030,8 @@ impl Database {
             raw_body: String::from_utf8_lossy(&raw_body).into_owned(),
             headers,
             route_destination_url,
+            request_method,
+            request_url,
             routing_reason,
             attempts,
         }))
