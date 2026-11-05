@@ -25,12 +25,12 @@
                     {% if let Some(value) = source.service_account %}<small>Service account: {{ value }}</small>{% endif %}
                     {% if !source.credential_keys.is_empty() %}<small>Stored credentials: {{ source.credential_keys|join(", ") }}</small>{% endif %}
                 </div>
-                {% if user.role.can_manage() %}<div class="row-actions"><a class="button button-secondary" href="/dashboard/config?edit_source={{ source.path_slug }}">Edit</a></div>{% endif %}
+                {% if user.can_write %}<div class="row-actions"><a class="button button-secondary" href="/dashboard/config?edit_source={{ source.path_slug }}">Edit</a></div>{% endif %}
             </div>
             {% endfor %}
         </div>
         {% endif %}
-        {% if user.role.can_manage() %}
+        {% if user.can_write %}
         <form method="post" action="/dashboard/config/source" class="stack-form config-form">
             <input type="hidden" name="csrf" value="{{ csrf }}">
             {% if source_editor.editing %}<input type="hidden" name="original_path_slug" value="{{ source_editor.path_slug }}">{% endif %}
