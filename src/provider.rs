@@ -142,9 +142,24 @@ pub trait Provider: Send + Sync {
         secret: &[u8],
         headers: &HeaderMap,
         raw_body: &[u8],
-        _settings: ProviderSettings<'_>,
+        settings: ProviderSettings<'_>,
     ) -> bool {
-        self.authenticate(secret, headers, raw_body)
+        self.authenticate_with_settings_diagnostic(secret, headers, raw_body, settings)
+            .await
+            .authenticated
+    }
+    async fn authenticate_with_settings_diagnostic(
+        &self,
+        secret: &[u8],
+        headers: &HeaderMap,
+        raw_body: &[u8],
+        _settings: ProviderSettings<'_>,
+    ) -> AuthenticationResult {
+        if self.authenticate(secret, headers, raw_body) {
+            AuthenticationResult::success()
+        } else {
+            AuthenticationResult::failure(AuthenticationFailureReason::Other)
+        }
     }
     fn auth_header_names(&self) -> &'static [&'static str] {
         &[]
@@ -196,6 +211,68 @@ pub trait Provider: Send + Sync {
 pub struct ProviderSettings<'a> {
     pub audience: Option<&'a str>,
     pub service_account: Option<&'a str>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AuthenticationFailureReason {
+    MissingBearer,
+    MalformedJwt,
+    JwksFetchFailed,
+    KidMismatch,
+    SignatureInvalid,
+    AudMismatch,
+    IssMismatch,
+    EmailUnverified,
+    EmailMismatch,
+    AudienceOrSaUnset,
+    AllowlistDenied,
+    Other,
+}
+
+impl AuthenticationFailureReason {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::MissingBearer => "missing_bearer",
+            Self::MalformedJwt => "malformed_jwt",
+            Self::JwksFetchFailed => "jwks_fetch_failed",
+            Self::KidMismatch => "kid_mismatch",
+            Self::SignatureInvalid => "signature_invalid",
+            Self::AudMismatch => "aud_mismatch",
+            Self::IssMismatch => "iss_mismatch",
+            Self::EmailUnverified => "email_unverified",
+            Self::EmailMismatch => "email_mismatch",
+            Self::AudienceOrSaUnset => "audience_or_sa_unset",
+            Self::AllowlistDenied => "allowlist_denied",
+            Self::Other => "other",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct AuthenticationResult {
+    pub authenticated: bool,
+    pub reason: Option<AuthenticationFailureReason>,
+    pub expected_aud: Option<String>,
+    pub expected_sa: Option<String>,
+    pub jwt_aud: Option<String>,
+    pub jwt_email: Option<String>,
+    pub jwt_iss: Option<String>,
+}
+
+impl AuthenticationResult {
+    fn success() -> Self {
+        Self {
+            authenticated: true,
+            ..Self::default()
+        }
+    }
+
+    fn failure(reason: AuthenticationFailureReason) -> Self {
+        Self {
+            reason: Some(reason),
+            ..Self::default()
+        }
+    }
 }
 
 #[derive(Debug, Default, Clone, Copy)]
@@ -651,8 +728,20 @@ pub struct GooglePlayRtdnProvider {
 
 #[derive(Debug, Deserialize)]
 struct GooglePushClaims {
-    email: String,
+    #[serde(default)]
+    email: Option<String>,
+    #[serde(default)]
     email_verified: bool,
+    #[serde(default)]
+    aud: Option<String>,
+    #[serde(default)]
+    iss: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum GoogleKeyError {
+    FetchFailed,
+    KidMismatch,
 }
 
 impl GooglePlayRtdnProvider {
@@ -668,7 +757,7 @@ impl GooglePlayRtdnProvider {
         }
     }
 
-    async fn key_for(&self, kid: &str) -> Option<DecodingKey> {
+    async fn key_for(&self, kid: &str) -> Result<DecodingKey, GoogleKeyError> {
         let cached_key = self.keys.read().await.get(kid).cloned();
         let cache_fresh = self
             .refreshed_at
@@ -676,22 +765,29 @@ impl GooglePlayRtdnProvider {
             .ok()
             .and_then(|value| *value)
             .is_some_and(|value| value.elapsed() < Self::KEY_CACHE_TTL);
-        if cache_fresh && cached_key.is_some() {
-            return cached_key;
+        if cache_fresh {
+            return cached_key.ok_or(GoogleKeyError::KidMismatch);
         }
-        self.refresh_keys().await;
-        self.keys.read().await.get(kid).cloned()
+        if !self.refresh_keys().await {
+            return cached_key.ok_or(GoogleKeyError::FetchFailed);
+        }
+        self.keys
+            .read()
+            .await
+            .get(kid)
+            .cloned()
+            .ok_or(GoogleKeyError::KidMismatch)
     }
 
-    async fn refresh_keys(&self) {
+    async fn refresh_keys(&self) -> bool {
         let Ok(response) = self.client.get(self.key_url).send().await else {
-            return;
+            return false;
         };
         if !response.status().is_success() {
-            return;
+            return false;
         }
         let Ok(certificates) = response.json::<HashMap<String, String>>().await else {
-            return;
+            return false;
         };
         let keys = certificates
             .into_iter()
@@ -700,12 +796,13 @@ impl GooglePlayRtdnProvider {
             })
             .collect::<HashMap<_, _>>();
         if keys.is_empty() {
-            return;
+            return false;
         }
         *self.keys.write().await = keys;
         if let Ok(mut refreshed_at) = self.refreshed_at.lock() {
             *refreshed_at = Some(Instant::now());
         }
+        true
     }
 
     #[cfg(test)]
@@ -739,19 +836,30 @@ impl Provider for GooglePlayRtdnProvider {
         false
     }
 
-    async fn authenticate_with_settings(
+    async fn authenticate_with_settings_diagnostic(
         &self,
         _secret: &[u8],
         headers: &HeaderMap,
         _raw_body: &[u8],
         settings: ProviderSettings<'_>,
-    ) -> bool {
-        let Some(audience) = settings.audience.filter(|value| !value.is_empty()) else {
-            return false;
+    ) -> AuthenticationResult {
+        let mut result = AuthenticationResult {
+            expected_aud: settings
+                .audience
+                .filter(|value| !value.is_empty())
+                .map(str::to_owned),
+            expected_sa: settings
+                .service_account
+                .filter(|value| !value.is_empty())
+                .map(str::to_owned),
+            ..AuthenticationResult::default()
         };
-        let Some(service_account) = settings.service_account.filter(|value| !value.is_empty())
-        else {
-            return false;
+        let (Some(audience), Some(service_account)) = (
+            settings.audience.filter(|value| !value.is_empty()),
+            settings.service_account.filter(|value| !value.is_empty()),
+        ) else {
+            result.reason = Some(AuthenticationFailureReason::AudienceOrSaUnset);
+            return result;
         };
         let Some(token) = headers
             .get("authorization")
@@ -759,27 +867,76 @@ impl Provider for GooglePlayRtdnProvider {
             .and_then(|value| value.strip_prefix("Bearer "))
             .filter(|value| !value.is_empty())
         else {
-            return false;
+            result.reason = Some(AuthenticationFailureReason::MissingBearer);
+            return result;
         };
         let Ok(header) = decode_header(token) else {
-            return false;
+            result.reason = Some(AuthenticationFailureReason::MalformedJwt);
+            return result;
         };
         if header.alg != Algorithm::RS256 {
-            return false;
+            result.reason = Some(AuthenticationFailureReason::MalformedJwt);
+            return result;
         }
         let Some(kid) = header.kid.as_deref() else {
-            return false;
+            result.reason = Some(AuthenticationFailureReason::MalformedJwt);
+            return result;
         };
-        let Some(key) = self.key_for(kid).await else {
-            return false;
+        let key = match self.key_for(kid).await {
+            Ok(key) => key,
+            Err(GoogleKeyError::FetchFailed) => {
+                result.reason = Some(AuthenticationFailureReason::JwksFetchFailed);
+                return result;
+            }
+            Err(GoogleKeyError::KidMismatch) => {
+                result.reason = Some(AuthenticationFailureReason::KidMismatch);
+                return result;
+            }
         };
+
+        let mut signature_validation = Validation::new(Algorithm::RS256);
+        signature_validation.validate_exp = false;
+        signature_validation.validate_nbf = false;
+        signature_validation.validate_aud = false;
+        signature_validation.aud = None;
+        signature_validation.iss = None;
+        let Ok(signed_claims) = decode::<GooglePushClaims>(token, &key, &signature_validation)
+        else {
+            result.reason = Some(AuthenticationFailureReason::SignatureInvalid);
+            return result;
+        };
+        let claims = signed_claims.claims;
+        result.jwt_aud = claims.aud.clone();
+        result.jwt_email = claims.email.clone();
+        result.jwt_iss = claims.iss.clone();
+        if claims.aud.as_deref() != Some(audience) {
+            result.reason = Some(AuthenticationFailureReason::AudMismatch);
+            return result;
+        }
+        if !matches!(
+            claims.iss.as_deref(),
+            Some("accounts.google.com" | "https://accounts.google.com")
+        ) {
+            result.reason = Some(AuthenticationFailureReason::IssMismatch);
+            return result;
+        }
         let mut validation = Validation::new(Algorithm::RS256);
         validation.set_audience(&[audience]);
         validation.set_issuer(&["accounts.google.com", "https://accounts.google.com"]);
-        let Ok(token_data) = decode::<GooglePushClaims>(token, &key, &validation) else {
-            return false;
+        if decode::<GooglePushClaims>(token, &key, &validation).is_err() {
+            result.reason = Some(AuthenticationFailureReason::Other);
+            return result;
         };
-        token_data.claims.email_verified && token_data.claims.email == service_account
+        if !claims.email_verified {
+            result.reason = Some(AuthenticationFailureReason::EmailUnverified);
+            return result;
+        }
+        if claims.email.as_deref() != Some(service_account) {
+            result.reason = Some(AuthenticationFailureReason::EmailMismatch);
+            return result;
+        }
+        result.authenticated = true;
+        result
     }
 
     fn auth_header_names(&self) -> &'static [&'static str] {
@@ -1702,6 +1859,22 @@ mod tests {
                 )
                 .await
         );
+        let audience_mismatch = provider
+            .authenticate_with_settings_diagnostic(
+                &[],
+                &headers,
+                b"{}",
+                ProviderSettings {
+                    audience: Some("https://example.test/wrong"),
+                    service_account: Some(service_account),
+                },
+            )
+            .await;
+        assert_eq!(
+            audience_mismatch.reason,
+            Some(AuthenticationFailureReason::AudMismatch)
+        );
+        assert_eq!(audience_mismatch.jwt_aud.as_deref(), Some(audience));
         assert!(
             !provider
                 .authenticate_with_settings(
@@ -1715,6 +1888,22 @@ mod tests {
                 )
                 .await
         );
+        let email_mismatch = provider
+            .authenticate_with_settings_diagnostic(
+                &[],
+                &headers,
+                b"{}",
+                ProviderSettings {
+                    audience: Some(audience),
+                    service_account: Some("other@example.iam.gserviceaccount.com"),
+                },
+            )
+            .await;
+        assert_eq!(
+            email_mismatch.reason,
+            Some(AuthenticationFailureReason::EmailMismatch)
+        );
+        assert_eq!(email_mismatch.jwt_email.as_deref(), Some(service_account));
         assert!(
             !provider
                 .authenticate_with_settings(
