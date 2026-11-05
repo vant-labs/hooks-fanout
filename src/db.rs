@@ -61,6 +61,7 @@ pub struct EventDetail {
     pub summary: EventSummary,
     pub raw_body: String,
     pub headers: Value,
+    pub route_destination_url: Option<String>,
     pub routing_reason: Option<String>,
     pub attempts: Vec<AttemptView>,
 }
@@ -1950,7 +1951,7 @@ impl Database {
     }
 
     pub async fn get_event(&self, event_id: Uuid) -> Result<Option<EventDetail>> {
-        let Some(row) = sqlx::query("SELECT id, source, event_type, raw_body, headers, routing_reason, matched_route, status, received_at, delivered_at FROM events WHERE id = $1").bind(event_id).fetch_optional(&self.pool).await? else { return Ok(None) };
+        let Some(row) = sqlx::query("SELECT e.id, e.source, e.event_type, e.raw_body, e.headers, d.destination_url AS route_destination_url, e.routing_reason, e.matched_route, e.status, e.received_at, e.delivered_at FROM events e LEFT JOIN deliveries d ON d.event_id = e.id WHERE e.id = $1").bind(event_id).fetch_optional(&self.pool).await? else { return Ok(None) };
         let summary = EventSummary {
             id: row.try_get("id")?,
             source: row.try_get("source")?,
@@ -1962,6 +1963,7 @@ impl Database {
         };
         let raw_body: Vec<u8> = row.try_get("raw_body")?;
         let headers = mask_sensitive_headers(&row.try_get::<Value, _>("headers")?);
+        let route_destination_url = row.try_get("route_destination_url")?;
         let routing_reason: Option<String> = row.try_get("routing_reason")?;
         let rows = sqlx::query("SELECT da.attempt, da.started_at, da.finished_at, da.status_code, da.latency_ms, da.response_body, da.error FROM delivery_attempts da JOIN deliveries d ON d.id = da.delivery_id WHERE d.event_id = $1 ORDER BY da.attempt").bind(event_id).fetch_all(&self.pool).await?;
         let attempts = rows
@@ -1982,6 +1984,7 @@ impl Database {
             summary,
             raw_body: String::from_utf8_lossy(&raw_body).into_owned(),
             headers,
+            route_destination_url,
             routing_reason,
             attempts,
         }))
