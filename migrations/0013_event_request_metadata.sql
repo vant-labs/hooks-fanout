@@ -1,0 +1,2 @@
+ALTER TABLE events ADD COLUMN IF NOT EXISTS request_method TEXT;
+ALTER TABLE events ADD COLUMN IF NOT EXISTS request_url TEXT;
