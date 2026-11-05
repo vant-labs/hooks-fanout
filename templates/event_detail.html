@@ -17,10 +17,6 @@
             <pre id="raw-body" class="code-block">{{ raw_body }}</pre>
         </article>
         <article class="panel">
-            <div class="panel-heading"><div><h2>Request</h2><p class="muted">The ingress request that accepted this event.</p></div></div>
-            <dl class="facts"><div><dt>Method</dt><dd>{{ detail.request_method.as_deref().unwrap_or("Unavailable") }}</dd></div><div><dt>URL</dt><dd class="breakable">{{ detail.request_url.as_deref().unwrap_or("Unavailable for older events") }}</dd></div></dl>
-        </article>
-        <article class="panel">
             <div class="panel-heading"><div><h2>Delivery attempts</h2><p class="muted">Every response and retry decision is recorded.</p></div></div>
             {% if detail.attempts.is_empty() %}
             <div class="empty-state compact"><h3>No attempts yet</h3><p>This event is waiting for a route or the next worker pass.</p></div>

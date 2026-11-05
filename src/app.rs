@@ -9,7 +9,7 @@ use anyhow::Context;
 use axum::{
     Json, Router,
     body::Bytes,
-    extract::{ConnectInfo, OriginalUri, Path, Query, State},
+    extract::{ConnectInfo, Path, Query, State},
     http::{HeaderMap, StatusCode, header},
     response::{IntoResponse, Response},
     routing::{get, patch, post, put},
@@ -329,7 +329,6 @@ pub(crate) fn resolve_provider_runtime(
 )]
 pub(crate) async fn ingest(
     State(state): State<Arc<AppState>>,
-    OriginalUri(uri): OriginalUri,
     Path(source): Path<String>,
     headers: HeaderMap,
     remote: ConnectInfo<SocketAddr>,
@@ -528,7 +527,6 @@ pub(crate) async fn ingest(
         .and_then(|value| value.to_str().ok())
         .unwrap_or("application/json");
     let stored_headers = headers_to_json(&headers, provider);
-    let request_url = request_url(&headers, &uri);
     let normalized_body = normalized
         .as_ref()
         .and_then(|event| serde_json::to_vec(event).ok());
@@ -538,7 +536,7 @@ pub(crate) async fn ingest(
         .unwrap_or_else(|| provider.dedupe_key(&payload, &body));
     let inserted = match state
         .db
-        .insert_event_with_provider_event_id_and_normalized_with_request(
+        .insert_event_with_provider_event_id_and_normalized(
             &source,
             &event_type,
             &body,
@@ -563,8 +561,6 @@ pub(crate) async fn ingest(
                 .route
                 .as_ref()
                 .map(|route| route.destination_url.as_str()),
-            Some("POST"),
-            Some(request_url.as_str()),
         )
         .await
     {
@@ -1043,25 +1039,6 @@ fn headers_to_json(headers: &HeaderMap, provider: &dyn Provider) -> Value {
         }
     }
     Value::Object(object)
-}
-
-fn request_url(headers: &HeaderMap, uri: &http::Uri) -> String {
-    let host = headers
-        .get("x-forwarded-host")
-        .or_else(|| headers.get(header::HOST))
-        .and_then(|value| value.to_str().ok())
-        .filter(|value| !value.is_empty());
-    let scheme = headers
-        .get("x-forwarded-proto")
-        .and_then(|value| value.to_str().ok())
-        .and_then(|value| value.split(',').next())
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .unwrap_or("http");
-    match host {
-        Some(host) => format!("{scheme}://{host}{uri}"),
-        None => uri.to_string(),
-    }
 }
 
 #[utoipa::path(
