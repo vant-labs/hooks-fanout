@@ -407,6 +407,31 @@ pub(crate) async fn ingest(
                 "webhook authentication failed"
             );
         }
+        if google_auth_debug_enabled(provider) {
+            tracing::warn!(
+                source = %source,
+                provider = provider.name(),
+                reason = authentication
+                    .reason
+                    .unwrap_or(AuthenticationFailureReason::Other)
+                    .as_str(),
+                expected_aud = ?authentication.expected_aud,
+                expected_sa = ?authentication.expected_sa,
+                authorization_present = authentication.debug.authorization_present,
+                authorization_scheme = %authentication.debug.authorization_scheme,
+                jwt_alg = ?authentication.debug.jwt_alg,
+                jwt_kid_present = authentication.debug.jwt_kid_present,
+                jwt_kid = ?authentication.debug.jwt_kid,
+                jwt_header = ?authentication.debug.jwt_header,
+                jwt_payload = ?authentication.debug.jwt_payload,
+                jwks_url = ?authentication.debug.jwks_url,
+                jwks_fetch_ok = ?authentication.debug.jwks_fetch_ok,
+                jwks_error = ?authentication.debug.jwks_error,
+                kid_in_jwks = ?authentication.debug.kid_in_jwks,
+                verify_step = ?authentication.debug.verify_step,
+                "google RTDN authentication debug"
+            );
+        }
         return StatusCode::UNAUTHORIZED.into_response();
     }
     state
@@ -987,6 +1012,11 @@ fn allowed_ip(
     }
     .or(remote);
     ip.is_some_and(|ip| allowed.contains(&ip))
+}
+
+fn google_auth_debug_enabled(provider: &dyn Provider) -> bool {
+    provider.name() == "google_play_rtdn"
+        && std::env::var("FANOUT_DEBUG_AUTH").is_ok_and(|value| value == "1")
 }
 
 fn headers_to_json(headers: &HeaderMap, provider: &dyn Provider) -> Value {

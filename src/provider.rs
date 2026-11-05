@@ -257,6 +257,23 @@ pub struct AuthenticationResult {
     pub jwt_aud: Option<String>,
     pub jwt_email: Option<String>,
     pub jwt_iss: Option<String>,
+    pub debug: AuthenticationDebug,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct AuthenticationDebug {
+    pub authorization_present: bool,
+    pub authorization_scheme: String,
+    pub jwt_alg: Option<String>,
+    pub jwt_kid_present: bool,
+    pub jwt_kid: Option<String>,
+    pub jwt_header: Option<Value>,
+    pub jwt_payload: Option<Value>,
+    pub jwks_url: Option<String>,
+    pub jwks_fetch_ok: Option<bool>,
+    pub jwks_error: Option<String>,
+    pub kid_in_jwks: Option<bool>,
+    pub verify_step: Option<String>,
 }
 
 impl AuthenticationResult {
@@ -738,10 +755,73 @@ struct GooglePushClaims {
     iss: Option<String>,
 }
 
-#[derive(Debug, Clone, Copy)]
-enum GoogleKeyError {
-    FetchFailed,
-    KidMismatch,
+struct GoogleKeyLookup {
+    key: Option<DecodingKey>,
+    jwks_fetch_ok: bool,
+    jwks_error: Option<&'static str>,
+    kid_in_jwks: bool,
+}
+
+fn authorization_debug(headers: &HeaderMap) -> (bool, String) {
+    let Some(value) = headers.get("authorization") else {
+        return (false, "missing".to_owned());
+    };
+    let Ok(value) = value.to_str() else {
+        return (true, "other".to_owned());
+    };
+    let scheme = value.split_whitespace().next();
+    if scheme.is_some_and(|value| value.eq_ignore_ascii_case("bearer")) {
+        (true, "Bearer".to_owned())
+    } else {
+        (true, "other".to_owned())
+    }
+}
+
+fn selected_jwt_part(token: &str, part_index: usize, fields: &[&str]) -> Option<Value> {
+    let part = token.split('.').nth(part_index)?;
+    let decoded = URL_SAFE_NO_PAD.decode(part).ok()?;
+    let object = serde_json::from_slice::<Value>(&decoded)
+        .ok()?
+        .as_object()?
+        .clone();
+    let selected = fields
+        .iter()
+        .filter_map(|field| {
+            object
+                .get(*field)
+                .cloned()
+                .map(|value| ((*field).to_owned(), value))
+        })
+        .collect();
+    Some(Value::Object(selected))
+}
+
+fn jwt_header_debug(token: &str) -> Option<Value> {
+    selected_jwt_part(token, 0, &["alg", "kid", "typ"])
+}
+
+fn jwt_payload_debug(token: &str) -> Option<Value> {
+    selected_jwt_part(
+        token,
+        1,
+        &["aud", "iss", "email", "email_verified", "sub", "exp", "iat"],
+    )
+}
+
+fn jwt_header_field(header: &Option<Value>, field: &str) -> Option<String> {
+    header
+        .as_ref()
+        .and_then(Value::as_object)
+        .and_then(|object| object.get(field))
+        .and_then(Value::as_str)
+        .map(str::to_owned)
+}
+
+fn jwt_header_field_present(header: &Option<Value>, field: &str) -> bool {
+    header
+        .as_ref()
+        .and_then(Value::as_object)
+        .is_some_and(|object| object.contains_key(field))
 }
 
 impl GooglePlayRtdnProvider {
@@ -757,7 +837,7 @@ impl GooglePlayRtdnProvider {
         }
     }
 
-    async fn key_for(&self, kid: &str) -> Result<DecodingKey, GoogleKeyError> {
+    async fn key_for(&self, kid: &str) -> GoogleKeyLookup {
         let cached_key = self.keys.read().await.get(kid).cloned();
         let cache_fresh = self
             .refreshed_at
@@ -766,28 +846,39 @@ impl GooglePlayRtdnProvider {
             .and_then(|value| *value)
             .is_some_and(|value| value.elapsed() < Self::KEY_CACHE_TTL);
         if cache_fresh {
-            return cached_key.ok_or(GoogleKeyError::KidMismatch);
+            return GoogleKeyLookup {
+                kid_in_jwks: cached_key.is_some(),
+                key: cached_key,
+                jwks_fetch_ok: true,
+                jwks_error: None,
+            };
         }
-        if !self.refresh_keys().await {
-            return cached_key.ok_or(GoogleKeyError::FetchFailed);
+        if let Err(error) = self.refresh_keys().await {
+            return GoogleKeyLookup {
+                kid_in_jwks: cached_key.is_some(),
+                key: cached_key,
+                jwks_fetch_ok: false,
+                jwks_error: Some(error),
+            };
         }
-        self.keys
-            .read()
-            .await
-            .get(kid)
-            .cloned()
-            .ok_or(GoogleKeyError::KidMismatch)
+        let key = self.keys.read().await.get(kid).cloned();
+        GoogleKeyLookup {
+            kid_in_jwks: key.is_some(),
+            key,
+            jwks_fetch_ok: true,
+            jwks_error: None,
+        }
     }
 
-    async fn refresh_keys(&self) -> bool {
+    async fn refresh_keys(&self) -> Result<(), &'static str> {
         let Ok(response) = self.client.get(self.key_url).send().await else {
-            return false;
+            return Err("request_failed");
         };
         if !response.status().is_success() {
-            return false;
+            return Err("http_status");
         }
         let Ok(certificates) = response.json::<HashMap<String, String>>().await else {
-            return false;
+            return Err("invalid_json");
         };
         let keys = certificates
             .into_iter()
@@ -796,13 +887,13 @@ impl GooglePlayRtdnProvider {
             })
             .collect::<HashMap<_, _>>();
         if keys.is_empty() {
-            return false;
+            return Err("no_valid_keys");
         }
         *self.keys.write().await = keys;
         if let Ok(mut refreshed_at) = self.refreshed_at.lock() {
             *refreshed_at = Some(Instant::now());
         }
-        true
+        Ok(())
     }
 
     #[cfg(test)]
@@ -843,6 +934,7 @@ impl Provider for GooglePlayRtdnProvider {
         _raw_body: &[u8],
         settings: ProviderSettings<'_>,
     ) -> AuthenticationResult {
+        let (authorization_present, authorization_scheme) = authorization_debug(headers);
         let mut result = AuthenticationResult {
             expected_aud: settings
                 .audience
@@ -852,6 +944,13 @@ impl Provider for GooglePlayRtdnProvider {
                 .service_account
                 .filter(|value| !value.is_empty())
                 .map(str::to_owned),
+            debug: AuthenticationDebug {
+                authorization_present,
+                authorization_scheme,
+                jwks_url: Some(self.key_url.to_owned()),
+                verify_step: Some("header_parse".to_owned()),
+                ..AuthenticationDebug::default()
+            },
             ..AuthenticationResult::default()
         };
         let (Some(audience), Some(service_account)) = (
@@ -870,6 +969,11 @@ impl Provider for GooglePlayRtdnProvider {
             result.reason = Some(AuthenticationFailureReason::MissingBearer);
             return result;
         };
+        result.debug.jwt_header = jwt_header_debug(token);
+        result.debug.jwt_payload = jwt_payload_debug(token);
+        result.debug.jwt_alg = jwt_header_field(&result.debug.jwt_header, "alg");
+        result.debug.jwt_kid = jwt_header_field(&result.debug.jwt_header, "kid");
+        result.debug.jwt_kid_present = jwt_header_field_present(&result.debug.jwt_header, "kid");
         let Ok(header) = decode_header(token) else {
             result.reason = Some(AuthenticationFailureReason::MalformedJwt);
             return result;
@@ -882,17 +986,27 @@ impl Provider for GooglePlayRtdnProvider {
             result.reason = Some(AuthenticationFailureReason::MalformedJwt);
             return result;
         };
-        let key = match self.key_for(kid).await {
-            Ok(key) => key,
-            Err(GoogleKeyError::FetchFailed) => {
-                result.reason = Some(AuthenticationFailureReason::JwksFetchFailed);
-                return result;
-            }
-            Err(GoogleKeyError::KidMismatch) => {
-                result.reason = Some(AuthenticationFailureReason::KidMismatch);
-                return result;
-            }
+        let lookup = self.key_for(kid).await;
+        result.debug.jwks_fetch_ok = Some(lookup.jwks_fetch_ok);
+        result.debug.jwks_error = lookup.jwks_error.map(str::to_owned);
+        result.debug.kid_in_jwks = Some(lookup.kid_in_jwks);
+        let Some(key) = lookup.key else {
+            result.debug.verify_step = Some(
+                if lookup.jwks_error.is_some() {
+                    "jwks_fetch"
+                } else {
+                    "kid_lookup"
+                }
+                .to_owned(),
+            );
+            result.reason = Some(if lookup.jwks_error.is_some() {
+                AuthenticationFailureReason::JwksFetchFailed
+            } else {
+                AuthenticationFailureReason::KidMismatch
+            });
+            return result;
         };
+        result.debug.verify_step = Some("rs256_verify".to_owned());
 
         let mut signature_validation = Validation::new(Algorithm::RS256);
         signature_validation.validate_exp = false;
@@ -906,6 +1020,7 @@ impl Provider for GooglePlayRtdnProvider {
             return result;
         };
         let claims = signed_claims.claims;
+        result.debug.verify_step = Some("claims_decode".to_owned());
         result.jwt_aud = claims.aud.clone();
         result.jwt_email = claims.email.clone();
         result.jwt_iss = claims.iss.clone();
@@ -1809,14 +1924,45 @@ mod tests {
         )
     }
 
+    fn google_test_provider_with_key_url(
+        key_url: &'static str,
+    ) -> (GooglePlayRtdnProvider, RsaPrivateKey) {
+        let private_key = RsaPrivateKey::new(&mut OsRng, 2048).unwrap();
+        (
+            GooglePlayRtdnProvider {
+                keys: RwLock::new(HashMap::new()),
+                refreshed_at: Mutex::new(None),
+                client: reqwest::Client::new(),
+                key_url,
+            },
+            private_key,
+        )
+    }
+
     fn google_test_token(
         private_key: &RsaPrivateKey,
         audience: &str,
         service_account: &str,
         expiration: i64,
     ) -> String {
+        google_test_token_with_kid(
+            private_key,
+            audience,
+            service_account,
+            expiration,
+            Some("test-key"),
+        )
+    }
+
+    fn google_test_token_with_kid(
+        private_key: &RsaPrivateKey,
+        audience: &str,
+        service_account: &str,
+        expiration: i64,
+        kid: Option<&str>,
+    ) -> String {
         let mut header = jsonwebtoken::Header::new(Algorithm::RS256);
-        header.kid = Some("test-key".to_owned());
+        header.kid = kid.map(str::to_owned);
         let claims = serde_json::json!({
             "aud": audience,
             "email": service_account,
@@ -1831,6 +1977,16 @@ mod tests {
             &jsonwebtoken::EncodingKey::from_rsa_der(private_der.as_bytes()),
         )
         .unwrap()
+    }
+
+    fn google_debug_settings<'a>(
+        audience: &'a str,
+        service_account: &'a str,
+    ) -> ProviderSettings<'a> {
+        ProviderSettings {
+            audience: Some(audience),
+            service_account: Some(service_account),
+        }
     }
 
     #[tokio::test]
@@ -1943,6 +2099,111 @@ mod tests {
                     .await
             );
         }
+    }
+
+    #[tokio::test]
+    async fn google_play_rtdn_debug_reports_missing_kid() {
+        let (provider, private_key) = google_test_provider();
+        let audience = "https://example.test/in/google_main";
+        let service_account = "pubsub@example.iam.gserviceaccount.com";
+        let token = google_test_token_with_kid(
+            &private_key,
+            audience,
+            service_account,
+            chrono::Utc::now().timestamp() + 3600,
+            None,
+        );
+        let mut headers = HeaderMap::new();
+        headers.insert("authorization", format!("Bearer {token}").parse().unwrap());
+        let result = provider
+            .authenticate_with_settings_diagnostic(
+                &[],
+                &headers,
+                b"{}",
+                google_debug_settings(audience, service_account),
+            )
+            .await;
+        assert_eq!(
+            result.reason,
+            Some(AuthenticationFailureReason::MalformedJwt)
+        );
+        assert_eq!(result.debug.jwt_alg.as_deref(), Some("RS256"));
+        assert!(!result.debug.jwt_kid_present);
+        assert_eq!(result.debug.jwt_kid, None);
+        assert_eq!(result.debug.verify_step.as_deref(), Some("header_parse"));
+        assert_eq!(
+            result
+                .debug
+                .jwt_payload
+                .as_ref()
+                .and_then(|payload| payload.get("aud").and_then(Value::as_str)),
+            Some(audience)
+        );
+    }
+
+    #[tokio::test]
+    async fn google_play_rtdn_debug_reports_kid_not_in_jwks() {
+        let (provider, private_key) = google_test_provider();
+        let audience = "https://example.test/in/google_main";
+        let service_account = "pubsub@example.iam.gserviceaccount.com";
+        let token = google_test_token_with_kid(
+            &private_key,
+            audience,
+            service_account,
+            chrono::Utc::now().timestamp() + 3600,
+            Some("unknown-key"),
+        );
+        let mut headers = HeaderMap::new();
+        headers.insert("authorization", format!("Bearer {token}").parse().unwrap());
+        let result = provider
+            .authenticate_with_settings_diagnostic(
+                &[],
+                &headers,
+                b"{}",
+                google_debug_settings(audience, service_account),
+            )
+            .await;
+        assert_eq!(
+            result.reason,
+            Some(AuthenticationFailureReason::KidMismatch)
+        );
+        assert_eq!(result.debug.jwt_kid.as_deref(), Some("unknown-key"));
+        assert_eq!(result.debug.jwks_fetch_ok, Some(true));
+        assert_eq!(result.debug.jwks_error, None);
+        assert_eq!(result.debug.kid_in_jwks, Some(false));
+        assert_eq!(result.debug.verify_step.as_deref(), Some("kid_lookup"));
+    }
+
+    #[tokio::test]
+    async fn google_play_rtdn_debug_reports_jwks_fetch_failure() {
+        let (provider, private_key) = google_test_provider_with_key_url("not-a-url");
+        let audience = "https://example.test/in/google_main";
+        let service_account = "pubsub@example.iam.gserviceaccount.com";
+        let token = google_test_token(
+            &private_key,
+            audience,
+            service_account,
+            chrono::Utc::now().timestamp() + 3600,
+        );
+        let mut headers = HeaderMap::new();
+        headers.insert("authorization", format!("Bearer {token}").parse().unwrap());
+        let result = provider
+            .authenticate_with_settings_diagnostic(
+                &[],
+                &headers,
+                b"{}",
+                google_debug_settings(audience, service_account),
+            )
+            .await;
+        assert_eq!(
+            result.reason,
+            Some(AuthenticationFailureReason::JwksFetchFailed)
+        );
+        assert_eq!(result.debug.jwks_url.as_deref(), Some("not-a-url"));
+        assert_eq!(result.debug.jwks_fetch_ok, Some(false));
+        assert_eq!(result.debug.jwks_error.as_deref(), Some("request_failed"));
+        assert_eq!(result.debug.kid_in_jwks, Some(false));
+        assert_eq!(result.debug.verify_step.as_deref(), Some("jwks_fetch"));
     }
 
     #[test]
