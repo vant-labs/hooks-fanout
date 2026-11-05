@@ -32,6 +32,7 @@ pub struct RoutingFields {
     pub reference: Option<String>,
     pub app_identifier: Option<String>,
     pub environment: Option<String>,
+    pub provider: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -45,6 +46,7 @@ pub enum NormalizedEventKind {
     Revoke,
     Upgrade,
     Downgrade,
+    Cancel,
 }
 
 impl NormalizedEventKind {
@@ -58,6 +60,7 @@ impl NormalizedEventKind {
             Self::Revoke => "revoke",
             Self::Upgrade => "upgrade",
             Self::Downgrade => "downgrade",
+            Self::Cancel => "cancel",
         }
     }
 }
@@ -94,6 +97,7 @@ impl NormalizedEvent {
 
     pub fn routing_fields(&self) -> RoutingFields {
         RoutingFields {
+            provider: Some(self.provider.clone()),
             app_identifier: Some(self.app_identifier.clone()),
             environment: Some(self.environment.clone()),
             plan_code: self.licence.clone(),
@@ -485,6 +489,18 @@ fn apple_normalized_event(
         .and_then(|settings| settings.product_licences)
         .and_then(|mapping| mapping.get(product_id))
         .cloned();
+    let mut raw = serde_json::json!({
+        "notification": claims,
+        "transaction": transaction,
+        "body_sha256": hex::encode(sha2::Sha256::digest(raw_body)),
+    });
+    if let Some(signed_date) = raw
+        .get("notification")
+        .and_then(|value| value.get("signedDate"))
+        .cloned()
+    {
+        raw["_fanout_event_time_millis"] = signed_date;
+    }
     Some(NormalizedEvent {
         schema_version: 1,
         provider: "apple".to_owned(),
@@ -509,11 +525,7 @@ fn apple_normalized_event(
         app_identifier: app_identifier.to_owned(),
         environment,
         expires_at: date_from_millis(transaction.get("expiresDate")),
-        raw: serde_json::json!({
-            "notification": claims,
-            "transaction": transaction,
-            "body_sha256": hex::encode(sha2::Sha256::digest(raw_body)),
-        }),
+        raw,
     })
 }
 
@@ -529,6 +541,10 @@ fn apple_event_kind(
         "EXPIRED" | "GRACE_PERIOD_EXPIRED" => NormalizedEventKind::Expire,
         "DID_FAIL_TO_RENEW" if subtype == Some("GRACE_PERIOD") => NormalizedEventKind::Grace,
         "DID_FAIL_TO_RENEW" => NormalizedEventKind::Expire,
+        "DID_CHANGE_RENEWAL_STATUS" if subtype == Some("AUTO_RENEW_DISABLED") => {
+            NormalizedEventKind::Cancel
+        }
+        "DID_CHANGE_RENEWAL_STATUS" => NormalizedEventKind::Renew,
         "REFUND" => NormalizedEventKind::Refund,
         "REVOKE" => NormalizedEventKind::Revoke,
         "DID_CHANGE_RENEWAL_PREF" => {
@@ -1024,14 +1040,13 @@ fn google_normalized_event(
                 value.get("purchaseToken")?.as_str()?.to_owned(),
                 value.get("sku")?.as_str()?.to_owned(),
             )
-        } else if let Some(value) = notification.get("voidedPurchaseNotification") {
+        } else {
+            let value = notification.get("voidedPurchaseNotification")?;
             (
                 NormalizedEventKind::Refund,
                 value.get("purchaseToken")?.as_str()?.to_owned(),
                 "unknown".to_owned(),
             )
-        } else {
-            return None;
         };
     let (environment, licence) = match settings {
         Some(settings) => (
@@ -1043,6 +1058,10 @@ fn google_normalized_event(
         ),
         None => ("production".to_owned(), None),
     };
+    let mut raw = notification.clone();
+    if let Some(event_time) = raw.get("eventTimeMillis").cloned() {
+        raw["_fanout_event_time_millis"] = event_time;
+    }
     Some(NormalizedEvent {
         schema_version: 1,
         provider: "google".to_owned(),
@@ -1057,14 +1076,15 @@ fn google_normalized_event(
         app_identifier: package.to_owned(),
         environment,
         expires_at: None,
-        raw: notification,
+        raw,
     })
 }
 
 fn google_subscription_kind(notification_type: u64) -> Option<NormalizedEventKind> {
     Some(match notification_type {
         1 | 2 | 7 | 9 => NormalizedEventKind::Renew,
-        3 | 12 | 20 => NormalizedEventKind::Revoke,
+        3 => NormalizedEventKind::Cancel,
+        12 | 20 => NormalizedEventKind::Revoke,
         4 => NormalizedEventKind::Purchase,
         5 | 6 | 10 | 11 | 22 => NormalizedEventKind::Grace,
         13 => NormalizedEventKind::Expire,
@@ -1748,6 +1768,34 @@ mod tests {
             provider.routing_fields(&payload).app_identifier.as_deref(),
             Some("com.example.app")
         );
+
+        let notification = serde_json::json!({
+            "version": "1.0",
+            "packageName": "com.example.store",
+            "subscriptionNotification": {
+                "notificationType": 4,
+                "purchaseToken": "token-1",
+                "subscriptionId": "premium-monthly"
+            }
+        });
+        let normalized_payload = serde_json::json!({
+            "message": {
+                "data": STANDARD.encode(serde_json::to_vec(&notification).unwrap()),
+                "messageId": "google-message-3"
+            }
+        });
+        let normalized = provider
+            .normalize_event_with_settings(
+                &normalized_payload,
+                b"body",
+                ProviderRuntimeSettings {
+                    environment: Some("sandbox"),
+                    ..ProviderRuntimeSettings::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(normalized.app_identifier, "com.example.store");
+        assert_eq!(normalized.environment, "sandbox");
 
         for (notification, event_type) in [
             (

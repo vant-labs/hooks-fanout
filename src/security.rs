@@ -20,6 +20,12 @@ pub fn verify_signature(secret: &[u8], body: &[u8], provided: Option<&str>) -> b
     expected.as_slice().ct_eq(&expected_bytes).into()
 }
 
+pub fn sign_forward(secret: &[u8], body: &[u8]) -> String {
+    let mut mac = HmacSha512::new_from_slice(secret).expect("HMAC accepts any key");
+    mac.update(body);
+    hex::encode(mac.finalize().into_bytes())
+}
+
 pub fn verify_hmac_sha256_signature(secret: &[u8], body: &[u8], provided: Option<&str>) -> bool {
     let Some(provided) = provided.and_then(|value| value.strip_prefix("hmacsha256=")) else {
         return false;
@@ -61,6 +67,7 @@ mod tests {
         mac.update(body);
         let signature = hex::encode(mac.finalize().into_bytes());
         assert!(verify_signature(secret, body, Some(&signature)));
+        assert_eq!(sign_forward(secret, body), signature);
         assert!(!verify_signature(
             secret,
             br#"{"event":"tampered"}"#,

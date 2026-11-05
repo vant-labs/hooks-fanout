@@ -41,7 +41,7 @@ The implemented source providers are `paystack`,
 
 Store purchases use the same provider boundary and the same Postgres event,
 deduplication, outbox and delivery queue. Store adapters emit the normalized
-event types `purchase`, `renew`, `expire`, `grace`, `refund`, `revoke`,
+event types `purchase`, `renew`, `cancel`, `expire`, `grace`, `refund`, `revoke`,
 `upgrade`, and `downgrade`; Paystack payloads and delivery behavior remain
 unchanged.
 
@@ -79,7 +79,7 @@ development; production keeps secure cookies enabled by default.
 
 `FANOUT_CONFIG` is optional and is used only as a first-boot seed. If it is
 unset or missing, the service starts with a Paystack source named
-`paystack_main`, no routes, and the default 90-day retention. Routes and
+`paystack_main`, no routes, and the default 45-day retention. Routes and
 sources are then managed in the dashboard and stored in Postgres. Secret
 values are never read directly from the file; `secret_env` names the
 environment variable that holds the value. Start local development from
@@ -93,7 +93,7 @@ allowed_ips = ["52.31.139.75", "52.49.173.169", "52.214.14.220"]
 
 [[route]]
 name = "timamu"
-destination_url = "https://example.invalid/timamu/paystack/webhook"
+destination_url = "https://api.timamu.app/v1/webhooks/paystack"
 match = { metadata_app = "timamu", plan_code_prefix = "PLN_tm", reference_prefix = "tm_" }
 
 [fallback]
@@ -103,8 +103,8 @@ mode = "unrouted"
 `allowed_ips = []` disables the allowlist for that source. `TRUST_PROXY=true`
 allows the first address in `X-Forwarded-For` to be checked; otherwise the TCP
 peer address is used. The request body limit is 256 KiB. `RETENTION_DAYS`
-defaults to 90; delivery records are kept for 30 days and delivered event
-records follow the configured retention.
+defaults to 45 and cannot exceed 45 days; delivery records are kept for 30 days
+and delivered event records follow the configured retention.
 
 ### Store provider setup
 
@@ -197,6 +197,19 @@ If no route matches, `fallback.mode = "unrouted"` stores the event without a
 delivery and sends an alert. `fallback.mode = "route:name"` sends it to that
 route, which is useful during rollout.
 
+### Routing Apple and Play apps
+
+Point App Store Server Notifications V2 at the existing source URL
+`/in/apple_production` or `/in/apple_sandbox`, and point Google Play RTDN at
+`/in/google_production` (or another configured source). In the dashboard,
+create one route row per destination and set its `app_identifier` to the
+verified Apple `bundleId` or Google `packageName`, plus `environment` when the
+source is environment-specific. The same account may therefore have multiple
+Apple or Play apps routed to different destinations. Adding another Vant app
+means adding another source/route row with its identifiers; it does not require
+new Fanout code or a new silo. An unknown identifier has no default app and is
+stored in the unrouted queue.
+
 ## How to tag payments
 
 Use one stable convention per product:
@@ -273,7 +286,7 @@ For example, add the Timamu route with both matching conventions:
 curl -X POST "$APP_URL/admin/routes" \
   -H "Authorization: Bearer $ADMIN_TOKEN" \
   -H 'content-type: application/json' \
-  -d '{"name":"timamu","target_url":"https://api.timamu.app/v1/billing/paystack/webhook","ref_prefix":"tm_","metadata_app":"timamu","enabled":true}'
+  -d '{"name":"timamu","target_url":"https://api.timamu.app/v1/webhooks/paystack","ref_prefix":"tm_","metadata_app":"timamu","enabled":true}'
 ```
 
 When the token is unset, admin routes return 404. `/healthz` is liveness,

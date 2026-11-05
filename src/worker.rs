@@ -140,6 +140,7 @@ fn forwardable_header(name: &str) -> bool {
         "content-type"
             | "authorization"
             | "x-paystack-signature"
+            | "x-fanout-signature"
             | "x-apple-signature"
             | "x-apple-notification-signature"
             | "x-apple-connect-signature"
