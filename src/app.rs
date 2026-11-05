@@ -1953,7 +1953,7 @@ pub(crate) async fn delete_admin_setting(
     post,
     path = "/admin/bootstrap",
     request_body = BootstrapBody,
-    responses((status = 201, description = "First admin created")),
+    responses((status = 201, description = "First owner created")),
     security(("admin_bearer" = [])),
     tag = "Admin API"
 )]
@@ -1979,7 +1979,7 @@ pub(crate) async fn bootstrap_admin(
             };
             match state
                 .db
-                .create_user(&body.email, &hash, crate::auth::Role::Admin)
+                .create_user(&body.email, &hash, crate::auth::Role::Owner)
                 .await
             {
                 Ok(_) => StatusCode::CREATED.into_response(),

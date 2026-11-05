@@ -8,6 +8,7 @@ use jsonwebtoken::{Algorithm, EncodingKey, Header, encode};
 use paystack_fanout::{
     AppState,
     app::build_router,
+    auth::Role,
     config::{Config, FallbackConfig, SourceConfig},
     db::Database,
 };
@@ -201,6 +202,40 @@ async fn source_crud_persists_slug_and_encrypted_credentials() {
     let delete = request(state, "DELETE", &format!("/admin/sources/{slug}"), None).await;
     assert_eq!(delete.status(), StatusCode::NO_CONTENT);
     db.pool.close().await;
+}
+
+#[tokio::test]
+#[serial]
+async fn bootstrap_creates_the_first_account_as_owner() {
+    if !can_run() {
+        return;
+    }
+    let (mut state, db) = setup().await;
+    sqlx::query("TRUNCATE sessions, audit_logs, users CASCADE")
+        .execute(&db.pool)
+        .await
+        .unwrap();
+    Arc::get_mut(&mut state).unwrap().bootstrap_token = Some("test-bootstrap".to_owned());
+    let response = request_with_auth(
+        state.clone(),
+        "POST",
+        "/admin/bootstrap",
+        Some(serde_json::json!({
+            "email": "bootstrapped-owner@example.com",
+            "password": "long secure password"
+        })),
+        Some("Bearer test-bootstrap"),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::CREATED);
+    assert_eq!(
+        db.find_user_by_email("bootstrapped-owner@example.com")
+            .await
+            .unwrap()
+            .unwrap()
+            .role,
+        Role::Owner
+    );
 }
 
 #[tokio::test]

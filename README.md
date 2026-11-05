@@ -75,6 +75,19 @@ The command prompts twice and never installs default credentials. Open
 `/login` to use the console. Set `COOKIE_SECURE=false` only for local HTTP
 development; production keeps secure cookies enabled by default.
 
+For container and hosted automation, use the one-time bootstrap endpoint
+instead of running a build command inside the service container:
+
+```sh
+curl -X POST "$APP_URL/admin/bootstrap" \
+  -H "Authorization: Bearer $ADMIN_BOOTSTRAP_TOKEN" \
+  -H 'content-type: application/json' \
+  -d '{"email":"owner@example.com","password":"use-a-secret-password"}'
+```
+
+When no account exists, this endpoint creates the first account as Owner and
+cannot be used again after bootstrap.
+
 ## Configuration
 
 `FANOUT_CONFIG` is optional and is used only as a first-boot seed. If it is
@@ -321,7 +334,8 @@ OpenAPI document at `/api-docs/openapi.json`.
    - `ADMIN_BOOTSTRAP_TOKEN`: a one-time token for creating the first admin.
 4. In Railway service settings, set the health check path to `/readyz`.
 5. Run `POST /admin/bootstrap` with the bootstrap bearer token and your email
-   and password after the first deploy, then enable 2FA.
+   and password after the first deploy; it creates the first Owner. Then enable
+   2FA.
 6. Use the service public URL as the Paystack webhook URL in test mode.
 7. In Sources, create `google_production`, `apple_production`, and
    `apple_sandbox` with their provider settings and encrypted credentials; the
