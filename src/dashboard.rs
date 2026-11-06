@@ -205,6 +205,9 @@ struct RouteEditor {
     timeout_seconds: i32,
     max_attempts: i32,
     enabled: bool,
+    outbound_auth_mode: String,
+    outbound_auth_header: String,
+    outbound_auth_secret_present: bool,
     editing: bool,
 }
 
@@ -221,6 +224,9 @@ impl Default for RouteEditor {
             timeout_seconds: 10,
             max_attempts: 10,
             enabled: true,
+            outbound_auth_mode: "none".to_owned(),
+            outbound_auth_header: String::new(),
+            outbound_auth_secret_present: false,
             editing: false,
         }
     }
@@ -271,6 +277,10 @@ struct RouteForm {
     timeout_seconds: i32,
     max_attempts: i32,
     enabled: Option<String>,
+    #[serde(default)]
+    outbound_auth_mode: String,
+    outbound_auth_header: Option<String>,
+    outbound_auth_secret: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1160,6 +1170,9 @@ async fn configuration(
             timeout_seconds: route.timeout_seconds,
             max_attempts: route.max_attempts,
             enabled: route.enabled,
+            outbound_auth_mode: route.outbound_auth_mode.clone(),
+            outbound_auth_header: route.outbound_auth_header.clone().unwrap_or_default(),
+            outbound_auth_secret_present: route.outbound_auth_secret_present,
             editing: true,
         })
         .unwrap_or_default();
@@ -1252,6 +1265,33 @@ async fn save_route(
         )
             .into_response();
     }
+    let auth_mode = if form.outbound_auth_mode.trim().is_empty() {
+        "none"
+    } else {
+        form.outbound_auth_mode.trim()
+    };
+    if !matches!(auth_mode, "none" | "static_header" | "hmac_sha512") {
+        return (
+            StatusCode::BAD_REQUEST,
+            "Unsupported outbound authentication mode",
+        )
+            .into_response();
+    }
+    let auth_header = clean_option(form.outbound_auth_header);
+    if auth_mode != "none"
+        && !auth_header
+            .as_deref()
+            .is_some_and(crate::app::valid_outbound_header_name)
+    {
+        return (
+            StatusCode::BAD_REQUEST,
+            "A safe outbound header name is required",
+        )
+            .into_response();
+    }
+    let auth_secret = form
+        .outbound_auth_secret
+        .and_then(|value| (!value.trim().is_empty()).then(|| value.trim().to_owned()));
     let matcher = RouteMatcher::from_extended(ExtendedRouteMatcher {
         metadata_app: clean_option(form.metadata_app),
         plan_code_prefix: clean_option(form.plan_code_prefix),
@@ -1269,6 +1309,9 @@ async fn save_route(
             form.timeout_seconds,
             form.max_attempts,
             form.enabled.is_some(),
+            auth_mode,
+            auth_header.as_deref(),
+            auth_secret.as_deref(),
         )
         .await
     {
