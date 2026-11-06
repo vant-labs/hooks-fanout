@@ -394,10 +394,10 @@ async fn admin_event_api_masks_sensitive_headers() {
     let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
     let body: Value = serde_json::from_slice(&body).unwrap();
     let headers = body.get("headers").unwrap();
-    assert_eq!(headers["x-paystack-signature"], "full-sig…");
-    assert_eq!(headers["authorization"], "Bearer f…");
-    assert_eq!(headers["cookie"], "session=…");
-    assert_eq!(headers["x-api-token"], "full-api…");
+    assert_eq!(headers["x-paystack-signature"], "[redacted]");
+    assert_eq!(headers["authorization"], "[redacted]");
+    assert_eq!(headers["cookie"], "[redacted]");
+    assert_eq!(headers["x-api-token"], "[redacted]");
     assert_eq!(headers["x-client"], "safe-value");
 }
 

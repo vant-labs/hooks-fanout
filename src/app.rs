@@ -10,7 +10,7 @@ use axum::{
     body::Bytes,
     extract::{ConnectInfo, OriginalUri, Path, Query, State},
     http::{HeaderMap, StatusCode, header},
-    response::{IntoResponse, Response},
+    response::{Html, IntoResponse, Redirect, Response},
     routing::{get, patch, post, put},
 };
 use chrono::{DateTime, Utc};
@@ -18,8 +18,8 @@ use jsonwebtoken::{Algorithm, DecodingKey, Validation, decode};
 use serde::Deserialize;
 use serde_json::{Value, json};
 use tokio::time::{Duration, sleep};
+use url::Url;
 use utoipa::{OpenApi, ToSchema};
-use utoipa_swagger_ui::SwaggerUi;
 use uuid::Uuid;
 
 use crate::{
@@ -44,6 +44,7 @@ pub struct AppState {
     pub metrics: Arc<Metrics>,
     pub http: reqwest::Client,
     pub trust_proxy: bool,
+    pub trusted_proxy_cidrs: Vec<ipnet::IpNet>,
     pub admin_token: Option<String>,
     pub bootstrap_token: Option<String>,
     pub purchase_jwt_secret: Option<String>,
@@ -82,9 +83,22 @@ impl AppState {
             metrics: Arc::new(Metrics::default()),
             http: reqwest::Client::builder()
                 .timeout(Duration::from_secs(10))
+                .redirect(reqwest::redirect::Policy::none())
                 .build()?,
             trust_proxy: std::env::var("TRUST_PROXY")
                 .is_ok_and(|value| value.eq_ignore_ascii_case("true")),
+            trusted_proxy_cidrs: std::env::var("TRUSTED_PROXY_CIDRS")
+                .ok()
+                .into_iter()
+                .flat_map(|value| {
+                    value
+                        .split(',')
+                        .map(str::trim)
+                        .map(str::to_owned)
+                        .collect::<Vec<_>>()
+                })
+                .filter_map(|value| value.parse().ok())
+                .collect(),
             admin_token: std::env::var("ADMIN_TOKEN").ok(),
             bootstrap_token: std::env::var("ADMIN_BOOTSTRAP_TOKEN")
                 .ok()
@@ -198,10 +212,9 @@ impl AppState {
 pub fn build_router(state: Arc<AppState>) -> Router {
     Router::new()
         .merge(crate::dashboard::router())
-        .merge(
-            SwaggerUi::new("/docs")
-                .url("/api-docs/openapi.json", crate::openapi::ApiDoc::openapi()),
-        )
+        .route("/docs", get(docs_redirect))
+        .route("/docs/", get(docs_page))
+        .route("/api-docs/openapi.json", get(openapi_document))
         .route("/in/{source}", post(ingest))
         .route("/v1/purchases/verify", post(verify_purchase))
         .route("/v1/entitlements", get(list_entitlements))
@@ -236,6 +249,20 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         .route("/admin/bootstrap", post(bootstrap_admin))
         .layer(axum::extract::DefaultBodyLimit::max(256 * 1024))
         .with_state(state)
+}
+
+async fn docs_redirect() -> Redirect {
+    Redirect::to("/docs/")
+}
+
+async fn docs_page() -> Html<&'static str> {
+    Html(
+        r#"<!doctype html><html lang="en"><head><meta charset="utf-8"><title>Swagger UI</title></head><body><main><h1>Swagger UI</h1><p>Open the <a href="/api-docs/openapi.json">OpenAPI document</a> in your API client or documentation viewer.</p></main></body></html>"#,
+    )
+}
+
+async fn openapi_document() -> Json<utoipa::openapi::OpenApi> {
+    Json(crate::openapi::ApiDoc::openapi())
 }
 
 #[derive(Debug, Clone, Default)]
@@ -352,6 +379,7 @@ pub(crate) async fn ingest(
     if !allowed_ip(
         source_config.allowed_ips.as_slice(),
         state.trust_proxy,
+        state.trusted_proxy_cidrs.as_slice(),
         &headers,
         Some(remote.0.ip()),
     ) {
@@ -1004,13 +1032,19 @@ async fn store_normalized_event(
 fn allowed_ip(
     allowed: &[IpAddr],
     trust_proxy: bool,
+    trusted_proxy_cidrs: &[ipnet::IpNet],
     headers: &HeaderMap,
     remote: Option<IpAddr>,
 ) -> bool {
     if allowed.is_empty() {
         return true;
     }
-    let ip = if trust_proxy {
+    let ip = if trust_proxy
+        && remote.is_some_and(|address| {
+            trusted_proxy_cidrs
+                .iter()
+                .any(|network| network.contains(&address))
+        }) {
         headers
             .get("x-forwarded-for")
             .and_then(|value| value.to_str().ok())
@@ -1038,6 +1072,20 @@ fn headers_to_json(headers: &HeaderMap, provider: &dyn Provider) -> Value {
             .iter()
             .filter_map(|value| value.to_str().ok().map(str::to_owned))
             .collect::<Vec<_>>();
+        let values = if name.eq_ignore_ascii_case(header::AUTHORIZATION.as_str()) {
+            values
+                .into_iter()
+                .map(|value| {
+                    value
+                        .split_whitespace()
+                        .next()
+                        .map(|scheme| format!("{scheme} [redacted]"))
+                        .unwrap_or_else(|| "[redacted]".to_owned())
+                })
+                .collect::<Vec<_>>()
+        } else {
+            values
+        };
         if values.len() == 1 {
             object.insert(name.to_owned(), Value::String(values[0].clone()));
         } else if !values.is_empty() {
@@ -1212,7 +1260,7 @@ pub(crate) async fn get_event(
     headers: HeaderMap,
     Path(id): Path<Uuid>,
 ) -> Response {
-    if !api_authorized(&state, &headers, false).await {
+    if !api_authorized(&state, &headers, true).await {
         return StatusCode::NOT_FOUND.into_response();
     }
     match state.db.get_event(id).await {
@@ -1356,6 +1404,18 @@ fn valid_source_provider_settings(
             && service_account.is_some_and(|value| !value.is_empty()))
 }
 
+pub(crate) fn valid_provider_config_urls(
+    provider_config: Option<&HashMap<String, String>>,
+) -> bool {
+    provider_config.is_none_or(|values| {
+        ["api_base_url", "token_url"].iter().all(|key| {
+            values
+                .get(*key)
+                .is_none_or(|value| valid_public_http_url(value, false))
+        })
+    })
+}
+
 #[utoipa::path(
     get,
     path = "/admin/sources",
@@ -1416,6 +1476,12 @@ async fn save_api_source(
         return Err((
             StatusCode::BAD_REQUEST,
             "Google Play sources require audience and service_account".to_owned(),
+        ));
+    }
+    if !valid_provider_config_urls(provider_config) {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "provider api_base_url and token_url must be public HTTPS URLs".to_owned(),
         ));
     }
     state
@@ -1672,7 +1738,7 @@ pub(crate) struct BootstrapBody {
 }
 
 fn valid_https_target(value: &str) -> bool {
-    value.starts_with("https://") && value.len() > "https://".len()
+    valid_public_http_url(value, false)
 }
 
 fn valid_outbound_auth(mode: Option<&str>, header_name: Option<&str>) -> bool {
@@ -1695,6 +1761,30 @@ pub(crate) fn valid_outbound_header_name(value: &str) -> bool {
                 | "upgrade"
         )
         && header::HeaderName::from_bytes(lower.as_bytes()).is_ok()
+}
+
+pub(crate) fn valid_public_http_url(value: &str, allow_http: bool) -> bool {
+    let Ok(url) = Url::parse(value.trim()) else {
+        return false;
+    };
+    if (url.scheme() != "https" && (!allow_http || url.scheme() != "http"))
+        || url.host_str().is_none()
+        || !url.username().is_empty()
+        || url.password().is_some()
+    {
+        return false;
+    }
+    let host = url.host_str().unwrap_or_default().to_ascii_lowercase();
+    if matches!(host.as_str(), "localhost" | "metadata.google.internal")
+        || host.ends_with(".localhost")
+        || host.ends_with(".local")
+    {
+        return false;
+    }
+    if let Ok(address) = host.parse::<IpAddr>() {
+        return !crate::security::is_private_or_local_ip(address);
+    }
+    true
 }
 
 async fn api_authorized(state: &AppState, headers: &HeaderMap, write: bool) -> bool {
@@ -2129,5 +2219,54 @@ pub async fn retention_loop(state: Arc<AppState>) {
             tracing::error!(error = %error, "retention cleanup failed");
         }
         sleep(Duration::from_secs(86_400)).await;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::HashMap;
+
+    use super::{valid_provider_config_urls, valid_public_http_url};
+
+    #[test]
+    fn outbound_urls_reject_credentials_and_private_targets() {
+        assert!(valid_public_http_url(
+            "https://destination.example/webhook",
+            false
+        ));
+        assert!(valid_public_http_url(
+            "http://destination.example/webhook",
+            true
+        ));
+        assert!(!valid_public_http_url("http://localhost/webhook", true));
+        assert!(!valid_public_http_url("https://127.0.0.1/webhook", false));
+        assert!(!valid_public_http_url(
+            "https://169.254.169.254/latest",
+            false
+        ));
+        assert!(!valid_public_http_url(
+            "https://user:pass@destination.example/",
+            false
+        ));
+        assert!(!valid_public_http_url(
+            "http://destination.example/webhook",
+            false
+        ));
+    }
+
+    #[test]
+    fn provider_config_urls_reject_private_or_http_endpoints() {
+        assert!(valid_provider_config_urls(Some(&HashMap::from([(
+            "api_base_url".to_owned(),
+            "https://api.example.test".to_owned(),
+        )]))));
+        assert!(!valid_provider_config_urls(Some(&HashMap::from([(
+            "token_url".to_owned(),
+            "http://127.0.0.1/token".to_owned(),
+        )]))));
+        assert!(valid_provider_config_urls(Some(&HashMap::from([(
+            "product_licence.example".to_owned(),
+            "plan".to_owned(),
+        )]))));
     }
 }

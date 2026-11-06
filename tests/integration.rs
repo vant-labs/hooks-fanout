@@ -16,8 +16,11 @@ use hmac::{Hmac, Mac};
 use paystack_fanout::{
     AppState,
     app::build_router,
-    config::{Config, FallbackConfig, RouteConfig, RouteMatcher, SourceConfig},
+    config::{
+        Config, ExtendedRouteMatcher, FallbackConfig, RouteConfig, RouteMatcher, SourceConfig,
+    },
     db::Database,
+    security::sign_forward,
 };
 use serde_json::json;
 use serial_test::serial;
@@ -25,7 +28,7 @@ use sha2::{Sha256, Sha512};
 use tower::ServiceExt;
 use wiremock::{
     Mock, MockServer, Request as WireRequest, Respond, ResponseTemplate,
-    matchers::{method, path},
+    matchers::{body_bytes, header, method, path},
 };
 
 type HmacSha512 = Hmac<Sha512>;
@@ -325,6 +328,74 @@ async fn ingest_is_deduplicated_and_worker_preserves_body_and_signature() {
             .unwrap()
             .len(),
         1
+    );
+    server.verify().await;
+}
+
+#[tokio::test]
+#[serial]
+async fn delivery_worker_uses_db_route_auth_and_exact_ingress_bytes() {
+    if !can_run() {
+        return;
+    }
+    let server = MockServer::start().await;
+    let body = br#" {"event":"charge.success","data":{"metadata":{"app":"test"}}} "#.to_vec();
+    let relay_secret = "route-secret";
+    let expected_signature = sign_forward(relay_secret.as_bytes(), &body);
+    Mock::given(method("POST"))
+        .and(path("/destination"))
+        .and(body_bytes(body.clone()))
+        .and(header("x-fanout-signature", expected_signature))
+        .respond_with(ResponseTemplate::new(200))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let (state, db) = setup(format!("{}/destination", server.uri()), None).await;
+    db.create_database_route_with_matcher(
+        "db-auth",
+        &format!("{}/destination", server.uri()),
+        &ExtendedRouteMatcher {
+            metadata_app: Some("test".to_owned()),
+            ..ExtendedRouteMatcher::default()
+        },
+        true,
+        "hmac_sha512",
+        Some("x-fanout-signature"),
+        Some(relay_secret),
+    )
+    .await
+    .unwrap();
+    state.clear_route_cache().await;
+
+    let app = build_router(state.clone()).layer(Extension(ConnectInfo(
+        std::net::SocketAddr::from(([127, 0, 0, 1], 1234)),
+    )));
+    let signature = signed(&body);
+    let response = app
+        .oneshot(
+            Request::post("/in/paystack_main")
+                .header("content-type", "application/json")
+                .header("x-paystack-signature", signature)
+                .header("x-fanout-signature", "spoofed-inbound-value")
+                .header("authorization", "Bearer provider-token")
+                .body(Body::from(body.clone()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let delivery = db.claim_delivery().await.unwrap().unwrap();
+    paystack_fanout::worker::process_one(&state, delivery).await;
+    let event_id = db.list_events(None, None, None, None, 10, 0).await.unwrap()[0].id;
+    assert_eq!(
+        db.get_event(event_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .summary
+            .status,
+        "delivered"
     );
     server.verify().await;
 }

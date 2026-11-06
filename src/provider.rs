@@ -20,6 +20,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::Digest;
 use tokio::sync::RwLock;
+use url::Url;
 use x509_parser::{pem::parse_x509_pem, prelude::parse_x509_certificate, public_key::PublicKey};
 
 use crate::security::{dedupe_key, verify_hmac_sha256_signature, verify_signature};
@@ -452,6 +453,7 @@ impl Provider for AppleServerNotificationsProvider {
             .unwrap_or(receipt)
             .to_owned();
         let signed_transaction = if let Some(base_url) = settings.api_base_url {
+            safe_provider_url(base_url)?;
             let private_key = settings
                 .private_key
                 .filter(|value| !value.is_empty())
@@ -496,6 +498,31 @@ impl Provider for AppleServerNotificationsProvider {
         )
         .ok_or_else(|| anyhow!("Apple transaction does not contain a valid purchase"))
     }
+}
+
+fn safe_provider_url(value: &str) -> Result<()> {
+    let parsed = Url::parse(value).map_err(|error| anyhow!("invalid provider URL: {error}"))?;
+    anyhow::ensure!(
+        parsed.scheme() == "https"
+            && parsed.host_str().is_some()
+            && parsed.username().is_empty()
+            && parsed.password().is_none(),
+        "provider URL must be HTTPS without embedded credentials"
+    );
+    let host = parsed.host_str().unwrap_or_default().to_ascii_lowercase();
+    anyhow::ensure!(
+        !matches!(host.as_str(), "localhost" | "metadata.google.internal")
+            && !host.ends_with(".localhost")
+            && !host.ends_with(".local"),
+        "provider URL targets a local host"
+    );
+    if let Ok(address) = host.parse::<std::net::IpAddr>() {
+        anyhow::ensure!(
+            !crate::security::is_private_or_local_ip(address),
+            "provider URL targets a private address"
+        );
+    }
+    Ok(())
 }
 
 fn apple_api_token(
@@ -743,6 +770,13 @@ pub struct GooglePlayRtdnProvider {
     key_url: &'static str,
 }
 
+fn no_redirect_client() -> reqwest::Client {
+    reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .expect("provider HTTP client is valid")
+}
+
 #[derive(Debug, Deserialize)]
 struct GooglePushClaims {
     #[serde(default)]
@@ -832,7 +866,7 @@ impl GooglePlayRtdnProvider {
         Self {
             keys: RwLock::new(HashMap::new()),
             refreshed_at: Mutex::new(None),
-            client: reqwest::Client::new(),
+            client: no_redirect_client(),
             key_url: Self::KEY_URL,
         }
     }
@@ -901,7 +935,7 @@ impl GooglePlayRtdnProvider {
         Self {
             keys: RwLock::new(keys),
             refreshed_at: Mutex::new(Some(Instant::now())),
-            client: reqwest::Client::new(),
+            client: no_redirect_client(),
             key_url: Self::KEY_URL,
         }
     }
@@ -1157,6 +1191,7 @@ impl Provider for GooglePlayRtdnProvider {
         let base_url = settings
             .api_base_url
             .unwrap_or("https://androidpublisher.googleapis.com");
+        safe_provider_url(base_url)?;
         let token = request.receipt.trim();
         if token.is_empty() {
             bail!("purchase token is empty");
@@ -1503,6 +1538,7 @@ async fn google_access_token(
         .and_then(|value| value.get("token_uri").and_then(Value::as_str))
         .or(token_url)
         .unwrap_or("https://oauth2.googleapis.com/token");
+    safe_provider_url(token_url)?;
     let now = Utc::now().timestamp();
     let claims = serde_json::json!({
         "iss": email,
