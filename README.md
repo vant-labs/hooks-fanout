@@ -52,6 +52,8 @@ unchanged.
 ## Quick start
 
 ```sh
+git clone <your-fork-url> paystack-fanout
+cd paystack-fanout
 cp .env.example .env
 docker compose up -d postgres
 git config core.hooksPath .githooks
@@ -64,8 +66,9 @@ Set `DATABASE_URL`, `MASTER_ENCRYPTION_KEY`, and `ADMIN_BOOTSTRAP_TOKEN`, then r
 cargo run -- --role all
 ```
 
-The listener binds to `0.0.0.0` and uses `PORT`, defaulting to `8080`. The
-Paystack URL is `https://your-host/in/paystack_main`.
+The listener binds to `0.0.0.0` and uses `PORT`, defaulting to `8080`. Set
+`PUBLIC_BASE_URL` to the public HTTPS origin for your deployment. The Paystack
+URL is then `${PUBLIC_BASE_URL}/in/paystack_main`.
 
 For the browser console, set a 32-byte `MASTER_ENCRYPTION_KEY`, then create the
 first owner after migrations run:
@@ -96,8 +99,8 @@ Each source has an explicit path slug and displays the paste URL
 `GET/POST /admin/sources` and `PATCH/DELETE /admin/sources/{slug}`. Routes
 remain managed by the existing `/dashboard/config` page and
 `GET/POST /admin/routes`, `PATCH/DELETE /admin/routes/{name}` APIs.
-Set `PUBLIC_BASE_URL` when the dashboard should render a host other than the
-default `https://vant-way.up.railway.app`.
+Set `PUBLIC_BASE_URL` so the dashboard renders the correct public host and
+source paste URLs. Do not commit a live deployment hostname to a fork.
 
 ```toml
 [source.paystack_main]
@@ -107,7 +110,7 @@ allowed_ips = ["52.31.139.75", "52.49.173.169", "52.214.14.220"]
 
 [[route]]
 name = "timamu"
-destination_url = "https://api.timamu.app/v1/webhooks/paystack"
+destination_url = "https://your-destination.example/v1/webhooks/paystack"
 match = { metadata_app = "timamu", plan_code_prefix = "PLN_tm", reference_prefix = "tm_" }
 
 [fallback]
@@ -226,6 +229,30 @@ means adding another source/route row with its identifiers; it does not require
 new Fanout code or a new silo. An unknown identifier has no default app and is
 stored in the unrouted queue.
 
+### Fresh-fork setup checklist
+
+After the first boot, configure a new deployment in this order:
+
+1. Open `/login` and sign in with the first account created by
+   `cargo run -- create-owner --email you@example.com`, or call
+   `POST /admin/bootstrap` once with `ADMIN_BOOTSTRAP_TOKEN`.
+2. Open `/dashboard/config` and create one Source for each provider ingress.
+   The source slug becomes `/in/{slug}` and the dashboard shows the exact URL
+   to paste into Paystack, App Store Server Notifications, or Pub/Sub.
+3. Add a Route for each destination. Set the app identifier to the Apple
+   bundle ID or Google package name and set the environment when needed.
+4. Select the outbound authentication mode on that Route. Secrets are stored
+   encrypted, masked after saving, and can be replaced without a redeploy.
+5. Send a provider test notification, then inspect the event detail page. It
+   shows the original request, the response returned to the provider, the
+   routing decision, and downstream delivery attempts.
+
+Do not copy production URLs, provider secrets, service-account JSON, private
+keys, bearer tokens, or database credentials into a fork, issue, screenshot,
+fixture, README, or commit. Use placeholders such as
+`https://your-public-host.example` and `https://your-destination.example` in
+public documentation. Keep `.env` and downloaded credential files out of Git.
+
 ## How to tag payments
 
 Use one stable convention per product:
@@ -253,10 +280,9 @@ Routes support three database-backed modes:
 The Routes panel masks saved secrets and never returns them through the admin
 API. Leaving the secret blank while editing keeps the stored value. The
 configured header replaces any same-named inbound header, and unsafe transport
-headers are rejected. For Timamu store routes, select `hmac_sha512`, enter
-`x-fanout-signature`, and use the same secret configured by Timamu's
-`PAYSTACK_WEBHOOK_SECRET` (or its documented fallback). This is a deployment
-setting, not a Fanout default.
+headers are rejected. For a store relay, select `hmac_sha512`, enter
+`x-fanout-signature`, and use the secret configured by the receiving service.
+This is a deployment setting, not a Fanout default.
 
 Migration `0014_store_forward_contract.sql` adds encrypted route-auth columns
 and marks existing deliveries to forward original bodies. Existing routes stay
@@ -321,13 +347,13 @@ When `ADMIN_TOKEN` or `ADMIN_BOOTSTRAP_TOKEN` is set, send `Authorization: Beare
 - `GET /admin/settings`, `PUT /admin/settings/{key}`, and
   `DELETE /admin/settings/{key}`
 
-For example, add the Timamu route with both matching conventions:
+For example, add a store route with both matching conventions:
 
 ```sh
 curl -X POST "$APP_URL/admin/routes" \
   -H "Authorization: Bearer $ADMIN_TOKEN" \
   -H 'content-type: application/json' \
-  -d '{"name":"timamu","target_url":"https://api.timamu.app/v1/webhooks/paystack","ref_prefix":"tm_","metadata_app":"timamu","enabled":true}'
+  -d '{"name":"store-payments","target_url":"https://your-destination.example/v1/webhooks/paystack","ref_prefix":"app_","metadata_app":"your-app","enabled":true}'
 ```
 
 For a store route, the same API accepts `outbound_auth_mode`,
@@ -359,10 +385,9 @@ OpenAPI document at `/api-docs/openapi.json`.
    and password after the first deploy, then enable 2FA.
 6. Use the service public URL as the Paystack webhook URL in test mode.
 7. In Sources, create `google_production`, `apple_production`, and
-   `apple_sandbox` with their provider settings and encrypted credentials; the
-   paste URLs are `https://vant-way.up.railway.app/in/google_production`,
-   `https://vant-way.up.railway.app/in/apple_production`, and
-   `https://vant-way.up.railway.app/in/apple_sandbox` for the current service.
+   `apple_sandbox` with their provider settings and encrypted credentials. Use
+   the source URLs rendered by your dashboard, such as
+   `${PUBLIC_BASE_URL}/in/google_production`.
 8. Add routes and additional sources from the dashboard; no production route
    file or redeploy is required.
 
@@ -395,7 +420,8 @@ Pages are available after signing in:
 
 - `/admin` overview with 24-hour and seven-day queue health.
 - `/dashboard/events` filtered event ledger and streamed CSV or newline JSON exports.
-- `/dashboard/events/{id}` raw payload, masked headers, routing decision, and attempts.
+- `/dashboard/events/{id}` raw payload, masked request headers, response returned
+  to the provider, routing decision, and downstream attempts.
 - `/dashboard/retries` and `/dashboard/unrouted` operational queues.
 - `/dashboard/config` persisted sources, routes, encrypted write-only secrets, and matcher tests.
 - `/dashboard/users`, `/dashboard/audit`, and `/dashboard/settings` for access and policy.

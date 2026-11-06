@@ -25,6 +25,8 @@ services:
       FANOUT_CONFIG: /etc/fanout/config.toml
       MASTER_ENCRYPTION_KEY: ${MASTER_ENCRYPTION_KEY:-0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef}
       ADMIN_BOOTSTRAP_TOKEN: ${ADMIN_BOOTSTRAP_TOKEN:-local-bootstrap-token}
+      PUBLIC_BASE_URL: ${PUBLIC_BASE_URL:-http://localhost:8080}
+      TIMAMU_API_BASE_URL: ${TIMAMU_API_BASE_URL:-http://localhost:8080}
       COOKIE_SECURE: "false"
     ports:
       - "8080:8080"

@@ -197,8 +197,8 @@ pub struct DatabaseSourceResponse {
 impl From<SourceView> for DatabaseSourceResponse {
     fn from(source: SourceView) -> Self {
         let ingest_path = format!("/in/{}", source.path_slug);
-        let base_url = std::env::var("PUBLIC_BASE_URL")
-            .unwrap_or_else(|_| "https://vant-way.up.railway.app".to_owned());
+        let base_url =
+            std::env::var("PUBLIC_BASE_URL").unwrap_or_else(|_| "http://localhost:8080".to_owned());
         Self {
             ingest_url: format!("{}{}", base_url.trim_end_matches('/'), ingest_path),
             ingest_path,
@@ -713,7 +713,7 @@ impl Database {
                     ingest_url: {
                         let path_slug: String = row.try_get("path_slug")?;
                         let base_url = std::env::var("PUBLIC_BASE_URL")
-                            .unwrap_or_else(|_| "https://vant-way.up.railway.app".to_owned());
+                            .unwrap_or_else(|_| "http://localhost:8080".to_owned());
                         format!("{}{}{}", base_url.trim_end_matches('/'), "/in/", path_slug)
                     },
                     provider: row.try_get("provider")?,

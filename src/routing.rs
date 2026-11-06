@@ -385,7 +385,7 @@ mod tests {
         let mut c = config();
         c.route = vec![RouteConfig {
             name: "timamu-google".into(),
-            destination_url: "https://api.timamu.app/v1/webhooks/google".into(),
+            destination_url: "https://your-destination.example/v1/webhooks/google".into(),
             matcher: RouteMatcher::from_extended(ExtendedRouteMatcher {
                 provider: Some("google".into()),
                 app_identifier: Some("com.vant.presslit.presslit_mobile".into()),
