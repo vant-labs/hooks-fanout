@@ -21,6 +21,12 @@
             <dl class="facts"><div><dt>Method</dt><dd>{{ detail.request_method.as_deref().unwrap_or("Unavailable") }}</dd></div><div><dt>URL</dt><dd class="breakable">{{ detail.request_url.as_deref().unwrap_or("Unavailable for older events") }}</dd></div></dl>
         </article>
         <article class="panel">
+            <div class="panel-heading"><div><h2>Response to provider</h2><p class="muted">The exact HTTP response returned by Fanout to the ingress provider.</p></div></div>
+            <dl class="facts"><div><dt>Status</dt><dd>{% if let Some(status) = detail.response_status %}HTTP {{ status }}{% else %}Unavailable for older events{% endif %}</dd></div></dl>
+            <h3 class="subheading">Headers</h3><pre class="code-block small-code">{{ detail.response_headers }}</pre>
+            <h3 class="subheading">Body</h3><pre class="code-block small-code">{{ detail.response_body }}</pre>
+        </article>
+        <article class="panel">
             <div class="panel-heading"><div><h2>Delivery attempts</h2><p class="muted">Every response and retry decision is recorded.</p></div></div>
             {% if detail.attempts.is_empty() %}
             <div class="empty-state compact"><h3>No attempts yet</h3><p>This event is waiting for a route or the next worker pass.</p></div>

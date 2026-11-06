@@ -617,6 +617,14 @@ pub(crate) async fn ingest(
                         .await;
                 });
             }
+            if let Err(error) = state
+                .db
+                .record_ingress_response(event_id, 200, &json!({}), b"")
+                .await
+            {
+                tracing::error!(error = %error, event_id = %event_id, "recording ingress response failed");
+                return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+            }
         }
     }
     StatusCode::OK.into_response()

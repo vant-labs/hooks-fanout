@@ -65,6 +65,9 @@ pub struct EventDetail {
     pub summary: EventSummary,
     pub raw_body: String,
     pub headers: Value,
+    pub response_status: Option<i32>,
+    pub response_headers: Value,
+    pub response_body: String,
     pub request_method: Option<String>,
     pub request_url: Option<String>,
     pub routing_reason: Option<String>,
@@ -2104,7 +2107,7 @@ impl Database {
     }
 
     pub async fn get_event(&self, event_id: Uuid) -> Result<Option<EventDetail>> {
-        let Some(row) = sqlx::query("SELECT id, source, event_type, raw_body, headers, request_method, request_url, routing_reason, matched_route, status, received_at, delivered_at FROM events WHERE id = $1").bind(event_id).fetch_optional(&self.pool).await? else { return Ok(None) };
+        let Some(row) = sqlx::query("SELECT id, source, event_type, raw_body, headers, response_status, response_headers, response_body, request_method, request_url, routing_reason, matched_route, status, received_at, delivered_at FROM events WHERE id = $1").bind(event_id).fetch_optional(&self.pool).await? else { return Ok(None) };
         let summary = EventSummary {
             id: row.try_get("id")?,
             source: row.try_get("source")?,
@@ -2116,6 +2119,14 @@ impl Database {
         };
         let raw_body: Vec<u8> = row.try_get("raw_body")?;
         let headers = mask_sensitive_headers(&row.try_get::<Value, _>("headers")?);
+        let response_status = row.try_get("response_status")?;
+        let response_headers = row
+            .try_get::<Option<Value>, _>("response_headers")?
+            .unwrap_or_else(|| serde_json::json!({}));
+        let response_body = row
+            .try_get::<Option<Vec<u8>>, _>("response_body")?
+            .map(|body| String::from_utf8_lossy(&body).into_owned())
+            .unwrap_or_default();
         let request_method = row.try_get("request_method")?;
         let request_url = row.try_get("request_url")?;
         let routing_reason: Option<String> = row.try_get("routing_reason")?;
@@ -2138,11 +2149,33 @@ impl Database {
             summary,
             raw_body: String::from_utf8_lossy(&raw_body).into_owned(),
             headers,
+            response_status,
+            response_headers,
+            response_body,
             request_method,
             request_url,
             routing_reason,
             attempts,
         }))
+    }
+
+    pub async fn record_ingress_response(
+        &self,
+        event_id: Uuid,
+        status: u16,
+        headers: &Value,
+        body: &[u8],
+    ) -> Result<()> {
+        sqlx::query(
+            "UPDATE events SET response_status = $2, response_headers = $3, response_body = $4 WHERE id = $1",
+        )
+        .bind(event_id)
+        .bind(i32::from(status))
+        .bind(headers)
+        .bind(body)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
     }
 
     pub async fn replay(
