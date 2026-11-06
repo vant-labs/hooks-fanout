@@ -203,6 +203,10 @@ input::placeholder { color: var(--text-muted); opacity: .75; }
 .login-card .muted { margin-bottom: 25px; }
 .login-card .stack-form { gap: 9px; }
 .login-card .stack-form label:not(:first-child) { margin-top: 7px; }
+.password-field { position: relative; }
+.password-field input { padding-right: 64px; }
+.password-toggle { position: absolute; top: 50%; right: 10px; border: 0; padding: 4px; transform: translateY(-50%); background: transparent; color: var(--brand); cursor: pointer; font-size: 11px; font-weight: 700; }
+.password-toggle:hover { text-decoration: underline; }
 .login-theme { margin: 25px auto 0; display: flex; }
 .alert { border-radius: 8px; padding: 11px 12px; margin: 0 0 15px; font-size: 12px; }
 .alert-error { color: var(--red); background: var(--red-soft); border: 1px solid color-mix(in srgb, var(--red) 25%, transparent); }

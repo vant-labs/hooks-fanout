@@ -228,6 +228,15 @@ async fn security_headers_cover_dashboard_api_auth_failure_and_error_responses()
     let login_page = request(state.clone(), "GET", "/login", None, None).await;
     assert_eq!(login_page.status(), StatusCode::OK);
     assert_security_headers(&login_page);
+    let login_html = String::from_utf8(
+        to_bytes(login_page.into_body(), usize::MAX)
+            .await
+            .unwrap()
+            .to_vec(),
+    )
+    .unwrap();
+    assert!(login_html.contains("data-password-toggle"));
+    assert!(login_html.contains("aria-label=\"Show password\""));
 
     let login_response = request(
         state.clone(),

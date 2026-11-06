@@ -19,7 +19,10 @@
       <label for="email">Email</label>
       <input id="email" name="email" type="email" autocomplete="username" required autofocus>
       <label for="password">Password</label>
-      <input id="password" name="password" type="password" autocomplete="current-password" required>
+      <div class="password-field">
+        <input id="password" name="password" type="password" autocomplete="current-password" required>
+        <button class="password-toggle" type="button" data-password-toggle data-password-target="#password" aria-controls="password" aria-label="Show password" aria-pressed="false">Show</button>
+      </div>
       <label for="totp_code">Authenticator code <span class="muted">if enabled</span></label>
       <input id="totp_code" name="totp_code" inputmode="numeric" pattern="[0-9]{6}" autocomplete="one-time-code" placeholder="123456">
       <button class="button button-primary button-wide" type="submit">Sign in</button>

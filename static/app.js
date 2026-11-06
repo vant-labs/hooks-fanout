@@ -10,6 +10,16 @@
       root.dataset.theme = next;
       localStorage.setItem("fanout-theme", next);
     }
+    const passwordButton = event.target.closest("[data-password-toggle]");
+    if (passwordButton) {
+      const password = document.querySelector(passwordButton.dataset.passwordTarget);
+      if (!password) return;
+      const visible = password.type === "password";
+      password.type = visible ? "text" : "password";
+      passwordButton.textContent = visible ? "Hide" : "Show";
+      passwordButton.setAttribute("aria-label", `${visible ? "Hide" : "Show"} password`);
+      passwordButton.setAttribute("aria-pressed", String(visible));
+    }
     const copyButton = event.target.closest("[data-copy-target]");
     if (copyButton) {
       const target = document.querySelector(copyButton.dataset.copyTarget);
