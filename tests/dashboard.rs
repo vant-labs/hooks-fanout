@@ -183,7 +183,6 @@ async fn dashboard_event_stream_requires_a_session() {
             .and_then(|value| value.to_str().ok()),
         Some("text/event-stream")
     );
-
     let overview_stream = request(
         state.clone(),
         "GET",

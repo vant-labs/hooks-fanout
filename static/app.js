@@ -79,7 +79,6 @@
       }));
     });
   }
-
   const liveOverview = document.querySelector("[data-live-overview]");
   if (liveOverview && window.EventSource) {
     const stream = new EventSource(`/dashboard/overview/live${window.location.search}`);
