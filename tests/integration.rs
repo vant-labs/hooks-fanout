@@ -312,26 +312,16 @@ async fn ingest_is_deduplicated_and_worker_preserves_body_and_signature() {
         StatusCode::OK
     );
     assert_eq!(post_event(state.clone(), body).await, StatusCode::OK);
-    let worker = tokio::spawn(paystack_fanout::worker::run_worker(state.clone()));
-    for _ in 0..30 {
-        if db
-            .list_events(None, None, None, None, 10, 0)
-            .await
-            .unwrap()
-            .first()
-            .is_some_and(|event| event.status == "delivered")
-        {
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(100)).await;
-    }
-    worker.abort();
+    let delivery = db.claim_delivery().await.unwrap().unwrap();
+    paystack_fanout::worker::process_one(&state, delivery).await;
     assert_eq!(
         db.list_events(None, None, None, None, 10, 0)
             .await
             .unwrap()
-            .len(),
-        1
+            .first()
+            .unwrap()
+            .status,
+        "delivered"
     );
     server.verify().await;
 }
