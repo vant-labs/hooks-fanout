@@ -1660,6 +1660,7 @@ impl Database {
             matched_route,
             routing_reason,
             status,
+            None,
             destination_url,
             None,
             None,
@@ -1683,6 +1684,7 @@ impl Database {
         matched_route: Option<&str>,
         routing_reason: Option<&str>,
         status: &str,
+        route_id: Option<Uuid>,
         destination_url: Option<&str>,
         request_method: Option<&str>,
         request_url: Option<&str>,
@@ -1719,14 +1721,15 @@ impl Database {
             return Ok(InsertResult::Duplicate);
         }
         if let Some(destination_url) = destination_url {
-            sqlx::query!(
-                r#"INSERT INTO deliveries (id, event_id, destination_url, status, attempts, next_attempt_at, created_at)
-                   VALUES ($1, $2, $3, 'pending', 0, $4, $4)"#,
-                delivery_id,
-                event_id,
-                destination_url,
-                now,
+            sqlx::query(
+                r#"INSERT INTO deliveries (id, event_id, destination_url, route_id, status, attempts, next_attempt_at, created_at)
+                   VALUES ($1, $2, $3, $4, 'pending', 0, $5, $5)"#,
             )
+            .bind(delivery_id)
+            .bind(event_id)
+            .bind(destination_url)
+            .bind(route_id)
+            .bind(now)
             .execute(&mut *tx)
             .await?;
             sqlx::query("UPDATE deliveries SET forward_original_body = $2 WHERE id = $1")
@@ -2151,15 +2154,6 @@ impl Database {
         route: Option<&str>,
         config: &Config,
     ) -> Result<bool> {
-        let destination = if let Some(route) = route {
-            config
-                .route
-                .iter()
-                .find(|r| r.name == route)
-                .map(|r| r.destination_url.clone())
-        } else {
-            None
-        };
         let mut tx = self.pool.begin().await?;
         let Some(row) =
             sqlx::query("SELECT matched_route, status FROM events WHERE id = $1 FOR UPDATE")
@@ -2170,24 +2164,45 @@ impl Database {
             return Ok(false);
         };
         let existing_route: Option<String> = row.try_get("matched_route")?;
-        let destination = destination.or_else(|| {
-            existing_route.as_deref().and_then(|name| {
+        let selected_route = route.or(existing_route.as_deref());
+        let database_route = if let Some(name) = selected_route {
+            sqlx::query_as::<_, (Uuid, String)>(
+                "SELECT id, COALESCE(target_url, destination_url) FROM routes WHERE name = $1 AND enabled = TRUE",
+            )
+            .bind(name)
+            .fetch_optional(&mut *tx)
+            .await?
+        } else {
+            None
+        };
+        let destination = route
+            .and_then(|name| {
                 config
                     .route
                     .iter()
                     .find(|r| r.name == name)
                     .map(|r| r.destination_url.clone())
             })
-        });
+            .or_else(|| {
+                existing_route.as_deref().and_then(|name| {
+                    config
+                        .route
+                        .iter()
+                        .find(|r| r.name == name)
+                        .map(|r| r.destination_url.clone())
+                })
+            })
+            .or_else(|| database_route.as_ref().map(|(_, url)| url.clone()));
         let Some(destination) = destination else {
             return Ok(false);
         };
+        let route_id = database_route.map(|(id, _)| id);
         let now = Utc::now();
         sqlx::query("DELETE FROM deliveries WHERE event_id = $1")
             .bind(event_id)
             .execute(&mut *tx)
             .await?;
-        sqlx::query("INSERT INTO deliveries (id, event_id, destination_url, status, attempts, next_attempt_at, created_at) VALUES ($1, $2, $3, 'pending', 0, $4, $4)").bind(Uuid::new_v4()).bind(event_id).bind(destination).bind(now).execute(&mut *tx).await?;
+        sqlx::query("INSERT INTO deliveries (id, event_id, destination_url, route_id, status, attempts, next_attempt_at, created_at) VALUES ($1, $2, $3, $4, 'pending', 0, $5, $5)").bind(Uuid::new_v4()).bind(event_id).bind(destination).bind(route_id).bind(now).execute(&mut *tx).await?;
         sqlx::query("UPDATE events SET status = 'pending', matched_route = COALESCE($2, matched_route), delivered_at = NULL WHERE id = $1").bind(event_id).bind(route).execute(&mut *tx).await?;
         tx.commit().await?;
         Ok(true)

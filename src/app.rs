@@ -558,6 +558,7 @@ pub(crate) async fn ingest(
                 MatchSource::Fallback => "fallback",
             }),
             status,
+            database_route_id,
             decision
                 .route
                 .as_ref()
@@ -966,6 +967,7 @@ async fn store_normalized_event(
             matched_route,
             Some("provider_verification"),
             status,
+            database_route_id,
             decision
                 .route
                 .as_ref()
