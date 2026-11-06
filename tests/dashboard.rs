@@ -167,7 +167,14 @@ async fn dashboard_event_stream_requires_a_session() {
     assert_eq!(unauthenticated.status(), StatusCode::UNAUTHORIZED);
 
     let (cookie, _) = login(state.clone(), "owner@example.com", "long secure password").await;
-    let stream = request(state, "GET", "/dashboard/events/live", Some(&cookie), None).await;
+    let stream = request(
+        state.clone(),
+        "GET",
+        "/dashboard/events/live",
+        Some(&cookie),
+        None,
+    )
+    .await;
     assert_eq!(stream.status(), StatusCode::OK);
     assert_eq!(
         stream
@@ -175,6 +182,32 @@ async fn dashboard_event_stream_requires_a_session() {
             .get("content-type")
             .and_then(|value| value.to_str().ok()),
         Some("text/event-stream")
+    );
+    let overview_stream = request(
+        state.clone(),
+        "GET",
+        "/dashboard/overview/live",
+        Some(&cookie),
+        None,
+    )
+    .await;
+    assert_eq!(overview_stream.status(), StatusCode::OK);
+    assert_eq!(
+        overview_stream
+            .headers()
+            .get("content-type")
+            .and_then(|value| value.to_str().ok()),
+        Some("text/event-stream")
+    );
+
+    let asset = request(state, "GET", "/static/app.js", None, None).await;
+    assert_eq!(asset.status(), StatusCode::OK);
+    assert_eq!(
+        asset
+            .headers()
+            .get("cache-control")
+            .and_then(|value| value.to_str().ok()),
+        Some("no-cache")
     );
 }
 
