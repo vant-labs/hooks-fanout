@@ -73,7 +73,11 @@ async fn setup(destination: String, alert_url: Option<String>) -> (Arc<AppState>
         alerts: None,
         retention_days: 90,
     };
-    let state = Arc::new(AppState::new_with_alert_url(config, db.clone(), alert_url).unwrap());
+    let mut state = Arc::new(AppState::new_with_alert_url(config, db.clone(), alert_url).unwrap());
+    #[cfg(feature = "test-support")]
+    Arc::get_mut(&mut state)
+        .unwrap()
+        .enable_test_outbound_transport();
     (state, db)
 }
 

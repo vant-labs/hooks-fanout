@@ -18,7 +18,6 @@ use jsonwebtoken::{Algorithm, DecodingKey, Validation, decode};
 use serde::Deserialize;
 use serde_json::{Value, json};
 use tokio::time::{Duration, sleep};
-use url::Url;
 use utoipa::{OpenApi, ToSchema};
 use uuid::Uuid;
 
@@ -61,6 +60,8 @@ pub struct AppState {
     pub runtime_alert_url: Arc<tokio::sync::RwLock<Option<String>>>,
     pub runtime_loaded_at: Arc<tokio::sync::RwLock<Instant>>,
     pub route_cache: Arc<tokio::sync::RwLock<RouteCache>>,
+    #[cfg(feature = "test-support")]
+    test_allow_private_outbound: bool,
     alert_url_override: Option<String>,
 }
 
@@ -122,8 +123,20 @@ impl AppState {
             runtime_alert_url: Arc::new(tokio::sync::RwLock::new(None)),
             runtime_loaded_at: Arc::new(tokio::sync::RwLock::new(Instant::now())),
             route_cache: Arc::new(tokio::sync::RwLock::new(None)),
+            #[cfg(feature = "test-support")]
+            test_allow_private_outbound: false,
             alert_url_override,
         })
+    }
+
+    #[cfg(feature = "test-support")]
+    pub fn enable_test_outbound_transport(&mut self) {
+        self.test_allow_private_outbound = true;
+    }
+
+    #[cfg(feature = "test-support")]
+    pub(crate) fn test_outbound_transport_enabled(&self) -> bool {
+        self.test_allow_private_outbound
     }
 
     pub async fn reload_runtime_config(&self) -> anyhow::Result<()> {
@@ -768,8 +781,10 @@ async fn verified_purchase_account_id(
     // second purchase credential. Introspect the already-authenticated
     // session at Timamu, then use only the returned account id for Fanout's
     // store-account binding.
-    let response = state
-        .http
+    let client = crate::security::public_http_client(&state.timamu_api_base_url, false)
+        .await
+        .map_err(|_| StatusCode::UNAUTHORIZED)?;
+    let response = client
         .get(format!("{}/v1/account/session", state.timamu_api_base_url))
         .bearer_auth(token)
         .send()
@@ -1797,27 +1812,7 @@ pub(crate) fn valid_outbound_header_name(value: &str) -> bool {
 }
 
 pub(crate) fn valid_public_http_url(value: &str, allow_http: bool) -> bool {
-    let Ok(url) = Url::parse(value.trim()) else {
-        return false;
-    };
-    if (url.scheme() != "https" && (!allow_http || url.scheme() != "http"))
-        || url.host_str().is_none()
-        || !url.username().is_empty()
-        || url.password().is_some()
-    {
-        return false;
-    }
-    let host = url.host_str().unwrap_or_default().to_ascii_lowercase();
-    if matches!(host.as_str(), "localhost" | "metadata.google.internal")
-        || host.ends_with(".localhost")
-        || host.ends_with(".local")
-    {
-        return false;
-    }
-    if let Ok(address) = host.parse::<IpAddr>() {
-        return !crate::security::is_private_or_local_ip(address);
-    }
-    true
+    crate::security::valid_public_url_syntax(value, allow_http)
 }
 
 async fn api_authorized(state: &AppState, headers: &HeaderMap, write: bool) -> bool {

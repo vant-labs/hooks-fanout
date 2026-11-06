@@ -11,7 +11,8 @@ deployment responsibilities.
 ## Reviewed evidence
 
 - Outbound and provider URL validation: `src/app.rs::valid_public_http_url`,
-  `src/provider.rs::safe_provider_url`.
+  `src/provider.rs::safe_provider_url`, and request-time DNS resolution and
+  address pinning in `src/security.rs::public_http_client`.
 - Global response headers: `src/app.rs::add_security_headers`.
 - Proxy trust: `src/app.rs::allowed_ip` and `AppState::trusted_proxy_cidrs`.
 - Secret masking: `src/db.rs::mask_sensitive_headers` and
@@ -22,6 +23,8 @@ deployment responsibilities.
   `src/app.rs::get_event`.
 - Exact-body relay authentication: `src/worker.rs::outbound_auth_value` and
   `tests/integration.rs::delivery_worker_uses_db_route_auth_and_exact_ingress_bytes`.
+- CSV export formula neutralization: `src/dashboard.rs::csv_field` and
+  `src/dashboard.rs::csv_tests::csv_formula_prefixes_are_neutralized`.
 - Header coverage: `tests/dashboard.rs::security_headers_cover_dashboard_api_auth_failure_and_error_responses`.
 - Dependency and secret scanning: `.github/workflows/ci.yml`,
   `.cargo/audit.toml`, and `.gitleaks.toml`.
@@ -30,10 +33,10 @@ deployment responsibilities.
 
 | ID | OWASP area | Severity | Finding | Remediation |
 | --- | --- | --- | --- | --- |
-| F-01 | A04 / API8 | Medium | Public hostnames are validated syntactically, but DNS results are not checked or pinned before outbound requests. DNS rebinding could reach a private address. | Resolve and validate every destination/provider address, then enforce egress controls or pin the validated address. |
+| F-01 | A04 / API8 | Resolved | Public hostnames are syntactically validated, resolved at request time, rejected if any result is private/local, and pinned to the validated address for the request. | Retain network egress controls and revalidate this behavior when the HTTP client or resolver changes. |
 | F-02 | A02 | Medium | `events.raw_body`, normalized payloads, headers, and response bodies remain plaintext in PostgreSQL. | Encrypt event data and backups, or provide equivalent database-level encryption and access controls. |
 | F-03 | A07 | Medium | Login throttling is an in-memory per-process map and is not shared across replicas. | Use a shared limiter and require stronger administrator authentication policy. |
-| F-04 | A03 | Low | CSV export quotes fields but does not neutralize spreadsheet formula prefixes. | Prefix values beginning with `=`, `+`, `-`, or `@`, or use NDJSON as the only raw export. |
+| F-04 | A03 | Resolved | CSV export prefixes values beginning with `=`, `+`, `-`, or `@` before CSV quoting. | Keep the neutralization test in place; prefer NDJSON when spreadsheet interoperability is unnecessary. |
 | F-05 | A06 | Low | `cargo audit` has an allowed unmaintained `basic-toml` warning; the RSA advisory is limited to test-only key generation and explicitly ignored. | Replace the test dependency and monitor the Askama dependency chain. |
 | F-06 | A05 | Low | HSTS is not emitted by the application, and API responses depend on the deployment edge for TLS policy. | Configure HSTS at the verified HTTPS edge; do not enable it for local HTTP. |
 
@@ -56,3 +59,8 @@ The application cannot prove from source alone that HTTPS termination, HSTS,
 database encryption, restricted backend access, firewall rules, egress policy,
 or production secret rotation are correctly configured. These must be verified
 in deployment records before production approval.
+
+The DNS control is application-level validation and pinning; it does not replace
+an egress firewall or a deployment policy that denies private networks. The
+dashboard formula control protects exported CSV values, but downstream spreadsheet
+importers may apply additional interpretation rules.

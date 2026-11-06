@@ -912,10 +912,15 @@ async fn export_events(
 }
 
 fn csv_field(value: &str) -> String {
+    let value = if matches!(value.chars().next(), Some('=' | '+' | '-' | '@')) {
+        format!("'{}", value)
+    } else {
+        value.to_owned()
+    };
     if value.contains([',', '"', '\n', '\r']) {
         format!("\"{}\"", value.replace('"', "\"\""))
     } else {
-        value.to_owned()
+        value
     }
 }
 
@@ -1637,4 +1642,18 @@ fn server_error(error: impl std::fmt::Display) -> Response {
         "Something went wrong. Try again.",
     )
         .into_response()
+}
+
+#[cfg(test)]
+mod csv_tests {
+    use super::csv_field;
+
+    #[test]
+    fn csv_formula_prefixes_are_neutralized() {
+        for value in ["=SUM(A1:A2)", "+1", "-1", "@cmd"] {
+            assert_eq!(csv_field(value), format!("'{}", value));
+        }
+        assert_eq!(csv_field("normal"), "normal");
+        assert_eq!(csv_field("=1,2"), "\"'=1,2\"");
+    }
 }

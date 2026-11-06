@@ -23,7 +23,9 @@ use tokio::sync::RwLock;
 use url::Url;
 use x509_parser::{pem::parse_x509_pem, prelude::parse_x509_certificate, public_key::PublicKey};
 
-use crate::security::{dedupe_key, verify_hmac_sha256_signature, verify_signature};
+use crate::security::{
+    dedupe_key, public_http_client, verify_hmac_sha256_signature, verify_signature,
+};
 
 /// The normalized fields a provider exposes to the routing layer.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -436,7 +438,7 @@ impl Provider for AppleServerNotificationsProvider {
         &self,
         request: &PurchaseVerificationRequest,
         settings: ProviderRuntimeSettings<'_>,
-        http: &reqwest::Client,
+        _http: &reqwest::Client,
     ) -> Result<NormalizedEvent> {
         let receipt = request.receipt.trim();
         if receipt.is_empty() {
@@ -454,6 +456,7 @@ impl Provider for AppleServerNotificationsProvider {
             .to_owned();
         let signed_transaction = if let Some(base_url) = settings.api_base_url {
             safe_provider_url(base_url)?;
+            let provider_http = public_http_client(base_url, false).await?;
             let private_key = settings
                 .private_key
                 .filter(|value| !value.is_empty())
@@ -472,7 +475,7 @@ impl Provider for AppleServerNotificationsProvider {
                 base_url.trim_end_matches('/'),
                 transaction_id
             );
-            let response = http.get(url).bearer_auth(token).send().await?;
+            let response = provider_http.get(url).bearer_auth(token).send().await?;
             if !response.status().is_success() {
                 bail!("Apple transaction lookup returned {}", response.status());
             }
@@ -766,15 +769,7 @@ impl Provider for AppStoreConnectWebhooksProvider {
 pub struct GooglePlayRtdnProvider {
     keys: RwLock<HashMap<String, DecodingKey>>,
     refreshed_at: Mutex<Option<Instant>>,
-    client: reqwest::Client,
     key_url: &'static str,
-}
-
-fn no_redirect_client() -> reqwest::Client {
-    reqwest::Client::builder()
-        .redirect(reqwest::redirect::Policy::none())
-        .build()
-        .expect("provider HTTP client is valid")
 }
 
 #[derive(Debug, Deserialize)]
@@ -866,7 +861,6 @@ impl GooglePlayRtdnProvider {
         Self {
             keys: RwLock::new(HashMap::new()),
             refreshed_at: Mutex::new(None),
-            client: no_redirect_client(),
             key_url: Self::KEY_URL,
         }
     }
@@ -905,7 +899,10 @@ impl GooglePlayRtdnProvider {
     }
 
     async fn refresh_keys(&self) -> Result<(), &'static str> {
-        let Ok(response) = self.client.get(self.key_url).send().await else {
+        let Ok(client) = public_http_client(self.key_url, false).await else {
+            return Err("url_resolution_failed");
+        };
+        let Ok(response) = client.get(self.key_url).send().await else {
             return Err("request_failed");
         };
         if !response.status().is_success() {
@@ -935,7 +932,6 @@ impl GooglePlayRtdnProvider {
         Self {
             keys: RwLock::new(keys),
             refreshed_at: Mutex::new(Some(Instant::now())),
-            client: no_redirect_client(),
             key_url: Self::KEY_URL,
         }
     }
@@ -1171,7 +1167,7 @@ impl Provider for GooglePlayRtdnProvider {
         &self,
         request: &PurchaseVerificationRequest,
         settings: ProviderRuntimeSettings<'_>,
-        http: &reqwest::Client,
+        _http: &reqwest::Client,
     ) -> Result<NormalizedEvent> {
         let package = settings
             .app_identifier
@@ -1181,17 +1177,13 @@ impl Provider for GooglePlayRtdnProvider {
             .service_account_key
             .filter(|value| !value.is_empty())
             .ok_or_else(|| anyhow!("Google service-account key is not configured"))?;
-        let access_token = google_access_token(
-            http,
-            credential,
-            settings.service_account,
-            settings.token_url,
-        )
-        .await?;
+        let access_token =
+            google_access_token(credential, settings.service_account, settings.token_url).await?;
         let base_url = settings
             .api_base_url
             .unwrap_or("https://androidpublisher.googleapis.com");
         safe_provider_url(base_url)?;
+        let provider_http = public_http_client(base_url, false).await?;
         let token = request.receipt.trim();
         if token.is_empty() {
             bail!("purchase token is empty");
@@ -1202,7 +1194,11 @@ impl Provider for GooglePlayRtdnProvider {
             package,
             token
         );
-        let response = http.get(url).bearer_auth(&access_token).send().await?;
+        let response = provider_http
+            .get(url)
+            .bearer_auth(&access_token)
+            .send()
+            .await?;
         let (response, is_subscription) = if response.status().is_success() {
             let purchase: Value = response.json().await?;
             (
@@ -1228,7 +1224,11 @@ impl Provider for GooglePlayRtdnProvider {
                 product_id,
                 token
             );
-            let response = http.get(url).bearer_auth(&access_token).send().await?;
+            let response = provider_http
+                .get(url)
+                .bearer_auth(&access_token)
+                .send()
+                .await?;
             if !response.status().is_success() {
                 bail!("Google purchase lookup returned {}", response.status());
             }
@@ -1266,7 +1266,7 @@ impl Provider for GooglePlayRtdnProvider {
                     token
                 )
             };
-            let ack = http
+            let ack = provider_http
                 .post(url)
                 .bearer_auth(&access_token)
                 .json(&serde_json::json!({}))
@@ -1518,7 +1518,6 @@ fn normalized_google_purchase(
 }
 
 async fn google_access_token(
-    http: &reqwest::Client,
     credential: &str,
     configured_email: Option<&str>,
     token_url: Option<&str>,
@@ -1550,7 +1549,8 @@ async fn google_access_token(
     let key = EncodingKey::from_rsa_pem(private_key.as_bytes())
         .map_err(|error| anyhow!("invalid Google service-account key: {error}"))?;
     let assertion = encode(&Header::new(Algorithm::RS256), &claims, &key)?;
-    let response = http
+    let token_http = public_http_client(token_url, false).await?;
+    let response = token_http
         .post(token_url)
         .form(&[
             ("grant_type", "urn:ietf:params:oauth:grant-type:jwt-bearer"),
@@ -1995,7 +1995,6 @@ mod tests {
             GooglePlayRtdnProvider {
                 keys: RwLock::new(HashMap::new()),
                 refreshed_at: Mutex::new(None),
-                client: reqwest::Client::new(),
                 key_url,
             },
             private_key,
@@ -2314,7 +2313,10 @@ mod tests {
         );
         assert_eq!(result.debug.jwks_url.as_deref(), Some("not-a-url"));
         assert_eq!(result.debug.jwks_fetch_ok, Some(false));
-        assert_eq!(result.debug.jwks_error.as_deref(), Some("request_failed"));
+        assert_eq!(
+            result.debug.jwks_error.as_deref(),
+            Some("url_resolution_failed")
+        );
         assert_eq!(result.debug.kid_in_jwks, Some(false));
         assert_eq!(result.debug.verify_step.as_deref(), Some("jwks_fetch"));
     }

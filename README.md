@@ -484,6 +484,12 @@ in `TRUSTED_PROXY_CIDRS`. Otherwise `X-Forwarded-For` is ignored and the TCP
 peer address is used. Do not expose the application port directly to the
 public internet when relying on forwarded client headers.
 
+Configured relay destinations and provider API endpoints are resolved at request
+time; private or local DNS results are rejected and the validated public address
+is pinned for that request. Keep deployment egress controls in place as a second
+line of defense. CSV exports neutralize formula-leading values; use NDJSON when
+spreadsheet import is not required.
+
 ### Screenshots
 
 Light mode:

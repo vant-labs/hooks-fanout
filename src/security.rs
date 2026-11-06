@@ -1,7 +1,11 @@
 use hmac::{Hmac, Mac};
 use sha2::{Digest, Sha256, Sha512};
-use std::net::IpAddr;
+use std::{
+    net::{IpAddr, SocketAddr},
+    time::Duration,
+};
 use subtle::ConstantTimeEq;
+use url::Url;
 
 type HmacSha256 = Hmac<Sha256>;
 type HmacSha512 = Hmac<Sha512>;
@@ -80,6 +84,67 @@ pub fn is_private_or_local_ip(address: IpAddr) -> bool {
     }
 }
 
+pub fn valid_public_url_syntax(value: &str, allow_http: bool) -> bool {
+    let Ok(url) = Url::parse(value.trim()) else {
+        return false;
+    };
+    if (url.scheme() != "https" && (!allow_http || url.scheme() != "http"))
+        || url.host_str().is_none()
+        || !url.username().is_empty()
+        || url.password().is_some()
+    {
+        return false;
+    }
+    let host = url.host_str().unwrap_or_default().to_ascii_lowercase();
+    if matches!(host.as_str(), "localhost" | "metadata.google.internal")
+        || host.ends_with(".localhost")
+        || host.ends_with(".local")
+    {
+        return false;
+    }
+    if let Ok(address) = host.parse::<IpAddr>() {
+        return !is_private_or_local_ip(address);
+    }
+    true
+}
+
+pub async fn public_http_client(value: &str, allow_http: bool) -> anyhow::Result<reqwest::Client> {
+    anyhow::ensure!(
+        valid_public_url_syntax(value, allow_http),
+        "outbound URL is not a public HTTP(S) URL"
+    );
+    let url = Url::parse(value.trim())?;
+    let host = url
+        .host_str()
+        .ok_or_else(|| anyhow::anyhow!("outbound URL has no host"))?;
+    let port = url
+        .port_or_known_default()
+        .ok_or_else(|| anyhow::anyhow!("outbound URL has no port"))?;
+    let addresses = if let Ok(address) = host.parse::<IpAddr>() {
+        vec![SocketAddr::new(address, port)]
+    } else {
+        tokio::net::lookup_host((host, port))
+            .await?
+            .collect::<Vec<_>>()
+    };
+    anyhow::ensure!(
+        !addresses.is_empty(),
+        "outbound URL did not resolve to an address"
+    );
+    anyhow::ensure!(
+        addresses
+            .iter()
+            .all(|address| !is_private_or_local_ip(address.ip())),
+        "outbound URL resolved to a private or local address"
+    );
+    reqwest::Client::builder()
+        .timeout(Duration::from_secs(10))
+        .redirect(reqwest::redirect::Policy::none())
+        .resolve(host, addresses[0])
+        .build()
+        .map_err(Into::into)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -138,5 +203,19 @@ mod tests {
         assert!(!is_private_or_local_ip(
             "2001:4860:4860::8888".parse().unwrap()
         ));
+    }
+
+    #[tokio::test]
+    async fn public_http_client_rejects_private_and_local_targets() {
+        assert!(
+            public_http_client("http://127.0.0.1:8080", true)
+                .await
+                .is_err()
+        );
+        assert!(
+            public_http_client("https://localhost/webhook", false)
+                .await
+                .is_err()
+        );
     }
 }

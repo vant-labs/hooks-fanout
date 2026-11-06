@@ -9,6 +9,17 @@ use crate::{app::AppState, db::ClaimedDelivery};
 
 pub const MAX_ATTEMPTS: i32 = 10;
 
+async fn delivery_http_client(
+    state: &AppState,
+    destination_url: &str,
+) -> anyhow::Result<reqwest::Client> {
+    #[cfg(feature = "test-support")]
+    if state.test_outbound_transport_enabled() {
+        return Ok(state.http.clone());
+    }
+    crate::security::public_http_client(destination_url, true).await
+}
+
 pub fn retry_delay(attempt: i32) -> Option<Duration> {
     match attempt {
         1 => Some(Duration::from_secs(30)),
@@ -40,7 +51,24 @@ pub async fn run_worker(state: Arc<AppState>) {
 pub async fn process_one(state: &AppState, delivery: ClaimedDelivery) {
     let started = Utc::now();
     let timer = Instant::now();
-    let mut request = state.http.post(&delivery.destination_url);
+    let client = match delivery_http_client(state, &delivery.destination_url).await {
+        Ok(client) => client,
+        Err(error) => {
+            finish_failure(
+                state,
+                &delivery,
+                started,
+                Utc::now(),
+                None,
+                None,
+                Some(&error.to_string()),
+                0,
+            )
+            .await;
+            return;
+        }
+    };
+    let mut request = client.post(&delivery.destination_url);
     let mut has_content_type = false;
     let configured_header = delivery.outbound_auth_header.as_deref();
     if let Some(headers) = delivery.headers.as_object() {

@@ -104,7 +104,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
-      - run: cargo test --all-targets
+      - run: cargo test --all-targets --all-features
         env:
           SQLX_OFFLINE: true
           DATABASE_URL: postgres://fanout:fanout@localhost:5432/fanout
