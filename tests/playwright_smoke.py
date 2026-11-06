@@ -6,7 +6,12 @@ with sync_playwright() as playwright:
     page = browser.new_page()
     page.goto("http://127.0.0.1:8080/login")
     page.get_by_label("Email").fill("owner@example.com")
-    page.get_by_label("Password").fill("long secure password")
+    password = page.locator("#password")
+    password.fill("long secure password")
+    page.get_by_role("button", name="Show password").click()
+    expect(password).to_have_attribute("type", "text")
+    page.get_by_role("button", name="Hide password").click()
+    expect(password).to_have_attribute("type", "password")
     page.get_by_role("button", name="Sign in").click()
     expect(page).to_have_url("http://127.0.0.1:8080/admin")
 

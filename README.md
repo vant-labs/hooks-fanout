@@ -102,6 +102,27 @@ remain managed by the existing `/dashboard/config` page and
 Set `PUBLIC_BASE_URL` so the dashboard renders the correct public host and
 source paste URLs. Do not commit a live deployment hostname to a fork.
 
+### Live dashboard
+
+The Overview and Events pages update through authenticated Server-Sent Events
+(SSE); a browser reload is not required after an event arrives or a delivery
+status changes. The browser opens `/dashboard/overview/live` on Overview and
+`/dashboard/events/live` on Events using the existing secure session cookie.
+These endpoints are dashboard-only and are not provider or admin bearer APIs.
+
+The reverse proxy in front of the service must allow long-lived streaming
+responses and must not buffer `text/event-stream`. It must also preserve the
+session cookie and route these paths to the same application process. The
+client reconnects automatically after a network interruption. Static dashboard
+assets use a versioned URL and revalidation so a deployment does not leave an
+older dashboard script in the browser indefinitely.
+
+To verify a deployment, sign in, open the browser Network panel, and confirm
+that the relevant live endpoint remains HTTP 200 with content type
+`text/event-stream`. A `401` means the session cookie is missing or expired;
+an immediate `404` means the deployed application does not contain the live
+dashboard release yet.
+
 ```toml
 [source.paystack_main]
 provider = "paystack"
@@ -247,6 +268,8 @@ After the first boot, configure a new deployment in this order:
 5. Send a provider test notification, then inspect the event detail page. It
    shows the original request, the response returned to the provider, the
    routing decision, and downstream delivery attempts.
+6. Open Overview and Events in separate browser tabs and verify their live
+   streams in the Network panel before handing the deployment to operators.
 
 Do not copy production URLs, provider secrets, service-account JSON, private
 keys, bearer tokens, or database credentials into a fork, issue, screenshot,
