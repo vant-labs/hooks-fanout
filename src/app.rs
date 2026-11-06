@@ -32,7 +32,7 @@ use crate::{
     metrics::Metrics,
     provider::{
         AuthenticationFailureReason, NormalizedEvent, Provider, ProviderRuntimeSettings,
-        ProviderSettings, PurchaseVerificationRequest, provider_for,
+        ProviderSettings, PurchaseVerificationRequest, RoutingFields, provider_for,
     },
     routing::{MatchSource, database_route_records, decide_with_fields, reference},
     security::bearer_matches,
@@ -491,10 +491,16 @@ pub(crate) async fn ingest(
         .as_ref()
         .map(|event| event.event_id.clone())
         .unwrap_or_else(|| provider.event_id(&payload, &body));
-    let routing_fields = normalized
+    let mut routing_fields = normalized
         .as_ref()
         .map(NormalizedEvent::routing_fields)
         .unwrap_or_else(|| provider.routing_fields(&payload));
+    apply_source_environment(
+        provider.name(),
+        &source,
+        provider_runtime.environment.as_deref(),
+        &mut routing_fields,
+    );
     let database_routes = state.cached_route_records().await;
     let database_match = database_route_records(&database_routes, &routing_fields);
     let database_route_id = database_match.map(|route| route.route.id);
@@ -619,6 +625,37 @@ pub(crate) async fn ingest(
         }
     }
     StatusCode::OK.into_response()
+}
+
+fn apply_source_environment(
+    provider: &str,
+    source: &str,
+    configured_environment: Option<&str>,
+    fields: &mut RoutingFields,
+) {
+    if provider != "google_play_rtdn" || fields.environment.is_some() {
+        return;
+    }
+    fields.environment = configured_environment
+        .and_then(normalize_source_environment)
+        .or_else(|| {
+            source
+                .strip_suffix("_production")
+                .map(|_| "production".to_owned())
+        })
+        .or_else(|| {
+            source
+                .strip_suffix("_sandbox")
+                .map(|_| "sandbox".to_owned())
+        });
+}
+
+fn normalize_source_environment(value: &str) -> Option<String> {
+    match value {
+        "production" | "Production" => Some("production".to_owned()),
+        "sandbox" | "Sandbox" => Some("sandbox".to_owned()),
+        _ => None,
+    }
 }
 
 #[derive(Debug, Deserialize, ToSchema)]
@@ -2075,5 +2112,74 @@ pub async fn retention_loop(state: Arc<AppState>) {
             tracing::error!(error = %error, "retention cleanup failed");
         }
         sleep(Duration::from_secs(86_400)).await;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use base64::{Engine, engine::general_purpose::STANDARD};
+    use serde_json::json;
+
+    use super::{apply_source_environment, provider_for};
+    use crate::{
+        config::ExtendedRouteMatcher,
+        provider::RoutingFields,
+        routing::{MatchSource, match_source, route_matches},
+    };
+
+    #[test]
+    fn google_test_notification_routes_using_source_environment() {
+        let notification = json!({
+            "version": "1.0",
+            "packageName": "com.vant.presslit.presslit_mobile",
+            "testNotification": {"version": "1.0"}
+        });
+        let payload = json!({
+            "message": {
+                "data": STANDARD.encode(serde_json::to_vec(&notification).unwrap())
+            }
+        });
+        let provider = provider_for("google_play_rtdn").unwrap();
+        let mut fields = provider.routing_fields(&payload);
+
+        apply_source_environment(provider.name(), "google_production", None, &mut fields);
+
+        let matcher = ExtendedRouteMatcher {
+            app_identifier: Some("com.vant.presslit.presslit_mobile".to_owned()),
+            environment: Some("production".to_owned()),
+            ..ExtendedRouteMatcher::default()
+        };
+        assert!(route_matches(&matcher, &fields));
+        assert_eq!(
+            match_source(&matcher, &fields),
+            Some(MatchSource::AppIdentifier)
+        );
+    }
+
+    #[test]
+    fn configured_google_environment_takes_precedence_over_source_slug() {
+        let mut fields = RoutingFields {
+            app_identifier: Some("com.example.app".to_owned()),
+            ..RoutingFields::default()
+        };
+        apply_source_environment(
+            "google_play_rtdn",
+            "google_production",
+            Some("sandbox"),
+            &mut fields,
+        );
+        assert_eq!(fields.environment.as_deref(), Some("sandbox"));
+    }
+
+    #[test]
+    fn non_google_sources_are_not_assigned_environment_from_slug() {
+        let mut fields = RoutingFields::default();
+        apply_source_environment(
+            "apple_server_notifications",
+            "apple_production",
+            None,
+            &mut fields,
+        );
+        assert_eq!(fields.environment, None);
     }
 }
