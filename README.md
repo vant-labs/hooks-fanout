@@ -4,8 +4,9 @@ Maintained by Vant Inc.
 
 The service provides one durable webhook endpoint for a small set of products.
 It verifies each source with its provider adapter, stores the original request,
-and forwards the same bytes and authentication headers to the selected product
-endpoint. It is intended for one business account, not as a hosted
+and forwards the same bytes to the selected product endpoint. Outbound
+authentication is selected per route in the database. It is intended for one
+business account, not as a hosted
 multi-customer service.
 
 ## Architecture
@@ -30,9 +31,12 @@ flowchart LR
 
 The ingest path does only authentication, JSON field extraction, routing,
 transactional persistence, and acknowledgement. Forwarding never runs inline.
-Paystack destinations receive the original body and authentication headers,
-unchanged. Store destinations receive the normalized event contract while the
-original provider body remains retained in the event ledger. All deliveries
+Every delivery uses the original ingress body bytes. Existing Paystack routes
+continue to receive their provider headers. A route may instead replace an
+inbound header with a configured static value or a fresh HMAC-SHA512 hex value
+computed over those exact bytes. Store destinations therefore receive the
+original Google or Apple provider payload; Timamu parses it only after verifying
+the configured relay header. All deliveries
 include `X-Fanout-Event-Id` and `X-Fanout-Attempt`.
 
 The implemented source providers are `paystack`,
@@ -233,7 +237,32 @@ Use one stable convention per product:
   `PLN_sc...`.
 
 The router does not modify a payload or create a new signature. Each product
-continues to verify Paystack's signature itself.
+continues to verify Paystack's signature itself. For store routes, configure
+the outbound authentication mode in the Routes panel; do not rely on an
+inbound provider header as the relay credential.
+
+### Route outbound authentication
+
+Routes support three database-backed modes:
+
+- `none` preserves existing route behavior.
+- `static_header` sends the literal encrypted secret as the configured header value.
+- `hmac_sha512` generates a new lowercase hexadecimal HMAC-SHA512 value for
+  every attempt over the exact stored body bytes.
+
+The Routes panel masks saved secrets and never returns them through the admin
+API. Leaving the secret blank while editing keeps the stored value. The
+configured header replaces any same-named inbound header, and unsafe transport
+headers are rejected. For Timamu store routes, select `hmac_sha512`, enter
+`x-fanout-signature`, and use the same secret configured by Timamu's
+`PAYSTACK_WEBHOOK_SECRET` (or its documented fallback). This is a deployment
+setting, not a Fanout default.
+
+Migration `0014_store_forward_contract.sql` adds encrypted route-auth columns
+and marks existing deliveries to forward original bodies. Existing routes stay
+in `none` mode until an administrator explicitly changes them. Configuration
+changes are read when a delivery is claimed, so queued retries use the current
+route setting without replaying stale authentication headers or redeploying.
 
 ## Paystack event fields
 
@@ -300,6 +329,12 @@ curl -X POST "$APP_URL/admin/routes" \
   -H 'content-type: application/json' \
   -d '{"name":"timamu","target_url":"https://api.timamu.app/v1/webhooks/paystack","ref_prefix":"tm_","metadata_app":"timamu","enabled":true}'
 ```
+
+For a store route, the same API accepts `outbound_auth_mode`,
+`outbound_auth_header`, and write-only `outbound_auth_secret`; for example,
+use `"outbound_auth_mode":"hmac_sha512"` and
+`"outbound_auth_header":"x-fanout-signature"`. The response exposes only
+whether a secret is stored.
 
 When the token is unset, admin routes return 404. `/healthz` is liveness,
 `/readyz` checks the database, and `/metrics` exposes Prometheus text metrics
