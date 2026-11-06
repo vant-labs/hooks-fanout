@@ -156,6 +156,16 @@ async fn ingest_rejects_bad_and_missing_signature_and_keeps_paystack_dedupe_key(
             .await
             .unwrap();
     assert_eq!(stored, paystack_fanout::security::dedupe_key(&body));
+    let event = db
+        .list_events(None, None, None, None, 10, 0)
+        .await
+        .unwrap()
+        .pop()
+        .unwrap();
+    let detail = db.get_event(event.id).await.unwrap().unwrap();
+    assert_eq!(detail.response_status, Some(200));
+    assert_eq!(detail.response_headers, json!({}));
+    assert!(detail.response_body.is_empty());
 }
 
 #[tokio::test]

@@ -13,7 +13,7 @@ feeds the result into the existing fanout event and entitlement path.
 - A service-account JSON key stored in a secret, never in the repository.
 - A product-to-licence mapping in the source configuration.
 - An HTTPS push endpoint such as
-  `https://vant-way.up.railway.app/in/google_production`.
+  `https://your-public-host.example/in/google_production`.
 
 ## Production source
 
@@ -22,12 +22,12 @@ In the dashboard, open Sources → Add source and enter:
 - Name: `Google production`
 - Path slug: `google_production`
 - Provider: `google_play_rtdn`
-- Audience: `https://vant-way.up.railway.app/in/google_production`
+- Audience: `https://your-public-host.example/in/google_production`
 - Push service account: the Pub/Sub service-account email
 - Provider settings: the package name, environment, and product/licence map
 - Encrypted credentials: the service-account JSON under `service_account_key`
 
-The resulting paste URL is `https://vant-way.up.railway.app/in/google_production`.
+The resulting paste URL is `https://your-public-host.example/in/google_production`.
 This writes the source to Postgres and does not require a redeploy. The
 first-boot configuration seed remains available for local setup:
 

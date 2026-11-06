@@ -9,8 +9,8 @@ source.
 
 - An App Store app with the bundle ID and in-app purchase products configured.
 - An HTTPS endpoint reachable by App Store Server Notifications V2:
-  `https://vant-way.up.railway.app/in/apple_production` or
-  `https://vant-way.up.railway.app/in/apple_sandbox`.
+  `https://your-public-host.example/in/apple_production` or
+  `https://your-public-host.example/in/apple_sandbox`.
 - An App Store Connect API key when server-side transaction lookups are
   enabled: issuer ID, key ID, and the private key.
 - A product-to-licence mapping in the source configuration.
@@ -30,8 +30,8 @@ In the dashboard, open Sources → Add source and create both of these rows:
 
 For each row, put `key_id`, `issuer_id`, and `private_key` in the encrypted
 credentials JSON field. The paste URLs are
-`https://vant-way.up.railway.app/in/apple_production` and
-`https://vant-way.up.railway.app/in/apple_sandbox`. Saving these rows writes
+`https://your-public-host.example/in/apple_production` and
+`https://your-public-host.example/in/apple_sandbox`. Saving these rows writes
 them to Postgres and does not require a redeploy.
 
 The first-boot configuration seed remains available for local setup:

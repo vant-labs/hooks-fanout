@@ -464,8 +464,8 @@ async fn configuration_page_lists_source_paste_url_and_edit_action() {
             .any(|window| window == slug.as_bytes())
     );
     assert!(
-        body.windows(b"https://vant-way.up.railway.app/in/".len())
-            .any(|window| window == b"https://vant-way.up.railway.app/in/")
+        body.windows(b"http://localhost:8080/in/".len())
+            .any(|window| window == b"http://localhost:8080/in/")
     );
 }
 

@@ -95,7 +95,7 @@ impl AppState {
             purchase_bearer_token: std::env::var("PURCHASE_BEARER_TOKEN").ok(),
             purchase_bearer_account_id: std::env::var("PURCHASE_BEARER_ACCOUNT_ID").ok(),
             timamu_api_base_url: std::env::var("TIMAMU_API_BASE_URL")
-                .unwrap_or_else(|_| "https://api.timamu.app".to_owned())
+                .unwrap_or_else(|_| "http://localhost:8080".to_owned())
                 .trim_end_matches('/')
                 .to_owned(),
             cookie_secure: std::env::var("COOKIE_SECURE")
@@ -616,6 +616,14 @@ pub(crate) async fn ingest(
                         ))
                         .await;
                 });
+            }
+            if let Err(error) = state
+                .db
+                .record_ingress_response(event_id, 200, &json!({}), b"")
+                .await
+            {
+                tracing::error!(error = %error, event_id = %event_id, "recording ingress response failed");
+                return StatusCode::INTERNAL_SERVER_ERROR.into_response();
             }
         }
     }
