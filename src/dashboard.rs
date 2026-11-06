@@ -137,6 +137,7 @@ struct EventsPage {
 struct EventDetailPage {
     user: SessionUser,
     detail: EventDetail,
+    routes: Vec<RouteView>,
     raw_body: String,
     headers_json: String,
     csrf: String,
@@ -669,6 +670,10 @@ async fn event_detail(
         Ok(None) => return (StatusCode::NOT_FOUND, "Event not found").into_response(),
         Err(error) => return server_error(error),
     };
+    let routes = match state.db.list_routes().await {
+        Ok(routes) => routes,
+        Err(error) => return server_error(error),
+    };
     let raw_body = serde_json::from_str::<Value>(&detail.raw_body)
         .ok()
         .and_then(|value| serde_json::to_string_pretty(&value).ok())
@@ -679,6 +684,7 @@ async fn event_detail(
         user,
         csrf: current_csrf(&state, &headers).await.unwrap_or_default(),
         detail,
+        routes,
         raw_body,
         headers_json,
     })
