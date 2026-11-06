@@ -34,6 +34,7 @@ pub fn router() -> Router<Arc<AppState>> {
         .route("/login", get(login).post(login_submit))
         .route("/logout", post(logout))
         .route("/admin", get(overview))
+        .route("/dashboard/overview/live", get(overview_live))
         .route("/dashboard/events", get(events))
         .route("/dashboard/events/live", get(events_live))
         .route("/dashboard/events/{id}", get(event_detail))
@@ -570,6 +571,78 @@ async fn overview(
         success_rate,
         recent_failures,
     })
+}
+
+async fn overview_live(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Query(query): Query<OverviewQuery>,
+) -> Response {
+    if require_user(&state, &headers).await.is_none() {
+        return StatusCode::UNAUTHORIZED.into_response();
+    }
+
+    let stream = futures_util::stream::unfold(
+        (
+            state,
+            query,
+            tokio::time::interval(std::time::Duration::from_secs(2)),
+        ),
+        |(state, query, mut ticker)| async move {
+            ticker.tick().await;
+            let payload = match overview_snapshot(&state, query.health_window()).await {
+                Ok(payload) => payload,
+                Err(error) => {
+                    tracing::warn!(error = %error, "live dashboard overview refresh failed");
+                    serde_json::json!({"error": "refresh_failed"})
+                }
+            };
+            let data = serde_json::to_string(&payload)
+                .unwrap_or_else(|_| "{\"error\":\"refresh_failed\"}".to_owned());
+            let event = Event::default().event("snapshot").data(data);
+            Some((Ok::<Event, Infallible>(event), (state, query, ticker)))
+        },
+    );
+    Sse::new(stream)
+        .keep_alive(KeepAlive::default())
+        .into_response()
+}
+
+async fn overview_snapshot(state: &AppState, window: HealthWindow) -> anyhow::Result<Value> {
+    let stats = state.db.overview_stats().await?;
+    let health = build_health_chart(state.db.overview_health(window).await?, window);
+    let recent_failures = state
+        .db
+        .list_events(Some("dead"), None, None, None, 8, 0)
+        .await?;
+    let success_rate = if stats.total_with_delivery == 0 {
+        "—".to_owned()
+    } else {
+        format!(
+            "{:.1}%",
+            (stats.delivered_with_delivery as f64 / stats.total_with_delivery as f64) * 100.0
+        )
+    };
+    Ok(serde_json::json!({
+        "stats": {
+            "received_24h": stats.received_24h,
+            "received_7d": stats.received_7d,
+            "delivered_24h": stats.delivered_24h,
+            "retrying": stats.retrying,
+            "dead": stats.dead,
+            "unrouted": stats.unrouted,
+        },
+        "success_rate": success_rate,
+        "signature_failures": state
+            .metrics
+            .verified_failed
+            .load(std::sync::atomic::Ordering::Relaxed),
+        "health": {
+            "received_path": health.received_path,
+            "delivered_path": health.delivered_path,
+        },
+        "recent_failures": recent_failures,
+    }))
 }
 
 async fn events(
@@ -1595,10 +1668,9 @@ async fn static_asset(Path(path): Path<String>) -> Response {
     response
         .headers_mut()
         .insert(header::CONTENT_TYPE, HeaderValue::from_static(content_type));
-    response.headers_mut().insert(
-        header::CACHE_CONTROL,
-        HeaderValue::from_static("public, max-age=31536000, immutable"),
-    );
+    response
+        .headers_mut()
+        .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-cache"));
     response
 }
 
