@@ -1,0 +1,8 @@
+[allowlist]
+description = "Synthetic values used by examples and CI only"
+regexTarget = "match"
+regexes = [
+  '''replace-with-64-hex-characters''',
+  '''0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef''',
+  '''eyJhbGciOiJub25lIiwidHlwIjoiSldUIn0\.eyJhdWQiOiJodHRwczovL2V4YW1wbGUudGVzdC9pbi9nb29nbGVfbWFpbiJ9\.''',
+]

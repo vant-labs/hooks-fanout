@@ -117,9 +117,10 @@ match = { metadata_app = "timamu", plan_code_prefix = "PLN_tm", reference_prefix
 mode = "unrouted"
 ```
 
-`allowed_ips = []` disables the allowlist for that source. `TRUST_PROXY=true`
-allows the first address in `X-Forwarded-For` to be checked; otherwise the TCP
-peer address is used. The request body limit is 256 KiB. `RETENTION_DAYS`
+`allowed_ips = []` disables the allowlist for that source. Set
+`TRUST_PROXY=true` only when the direct peer is in one of the CIDRs listed in
+`TRUSTED_PROXY_CIDRS`; only then is the first address in `X-Forwarded-For`
+checked. Otherwise the TCP peer address is used. The request body limit is 256 KiB. `RETENTION_DAYS`
 defaults to 45 days; delivery records are kept for 30 days
 and delivered event records follow the configured retention.
 
@@ -268,6 +269,11 @@ continues to verify Paystack's signature itself. For store routes, configure
 the outbound authentication mode in the Routes panel; do not rely on an
 inbound provider header as the relay credential.
 
+The OWASP-aligned review, evidence references, residual findings, and
+deployment-dependent controls are tracked in
+[`docs/security-report.md`](docs/security-report.md). It is an engineering
+review, not a certification or a substitute for production verification.
+
 ### Route outbound authentication
 
 Routes support three database-backed modes:
@@ -283,6 +289,19 @@ configured header replaces any same-named inbound header, and unsafe transport
 headers are rejected. For a store relay, select `hmac_sha512`, enter
 `x-fanout-signature`, and use the secret configured by the receiving service.
 This is a deployment setting, not a Fanout default.
+
+Inbound `Authorization` headers are never copied to a destination or retained
+in the event header record. Provider credentials are used only for provider
+verification. Destination URLs must be public HTTP(S) endpoints without
+embedded credentials; redirects are disabled for outbound requests. If a
+deployment is behind a proxy, set `TRUST_PROXY=true` only with an explicit
+`TRUSTED_PROXY_CIDRS` allowlist.
+
+Every pull request runs formatting, lint, tests, Docker smoke checks, and a
+dependency advisory audit. The audit configuration contains one documented
+exception for the RSA test-only key generator; it is not part of the release
+binary. Keep test credentials synthetic and rotate any credential that is ever
+accidentally committed.
 
 Migration `0014_store_forward_contract.sql` adds encrypted route-auth columns
 and marks existing deliveries to forward original bodies. Existing routes stay
@@ -440,6 +459,36 @@ Browser sessions use an HttpOnly, SameSite=Lax cookie, rotate on sign-in, and
 require a session-bound CSRF value on every mutating form. Passwords use
 Argon2id. Login attempts are rate limited per account, and an optional TOTP
 code is checked when a user has one configured.
+
+### Transport and browser security
+
+The application adds `X-Content-Type-Options: nosniff`,
+`Referrer-Policy: no-referrer`, `Content-Security-Policy: frame-ancestors
+'none'`, and `X-Frame-Options: DENY` to successful and error responses. The
+dashboard does not require framing or embedding and should be served as a
+top-level application.
+
+Terminate HTTPS at the trusted edge or reverse proxy and restrict direct
+access to the application port. Set `COOKIE_SECURE=true` (the default) for
+HTTPS deployments; session cookies then include `Secure`, `HttpOnly`, and
+`SameSite=Lax`. Local HTTP development may set `COOKIE_SECURE=false` only in a
+local environment.
+
+Enable HSTS at the TLS edge after the HTTPS deployment is verified, for example
+with `Strict-Transport-Security: max-age=31536000; includeSubDomains` when all
+covered subdomains are HTTPS-only. Do not enable HSTS blindly for local HTTP
+development.
+
+Set `TRUST_PROXY=true` only when the direct peer is a controlled proxy listed
+in `TRUSTED_PROXY_CIDRS`. Otherwise `X-Forwarded-For` is ignored and the TCP
+peer address is used. Do not expose the application port directly to the
+public internet when relying on forwarded client headers.
+
+Configured relay destinations and provider API endpoints are resolved at request
+time; private or local DNS results are rejected and the validated public address
+is pinned for that request. Keep deployment egress controls in place as a second
+line of defense. CSV exports neutralize formula-leading values; use NDJSON when
+spreadsheet import is not required.
 
 ### Screenshots
 
