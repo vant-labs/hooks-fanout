@@ -13,6 +13,8 @@ async fn delivery_http_client(
     state: &AppState,
     destination_url: &str,
 ) -> anyhow::Result<reqwest::Client> {
+    #[cfg(not(feature = "test-support"))]
+    let _ = state;
     #[cfg(feature = "test-support")]
     if state.test_outbound_transport_enabled() {
         return Ok(state.http.clone());

@@ -42,7 +42,7 @@ async fn setup(destination: String, alert_url: Option<String>) -> (Arc<AppState>
         .await
         .unwrap();
     db.migrate().await.unwrap();
-    sqlx::query("TRUNCATE delivery_attempts, deliveries, events CASCADE")
+    sqlx::query("TRUNCATE delivery_attempts, deliveries, events, routes CASCADE")
         .execute(&db.pool)
         .await
         .unwrap();
@@ -73,7 +73,9 @@ async fn setup(destination: String, alert_url: Option<String>) -> (Arc<AppState>
         alerts: None,
         retention_days: 90,
     };
-    let mut state = Arc::new(AppState::new_with_alert_url(config, db.clone(), alert_url).unwrap());
+    let state = Arc::new(AppState::new_with_alert_url(config, db.clone(), alert_url).unwrap());
+    #[cfg(feature = "test-support")]
+    let mut state = state;
     #[cfg(feature = "test-support")]
     Arc::get_mut(&mut state)
         .unwrap()
