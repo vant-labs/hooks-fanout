@@ -42,7 +42,7 @@ async fn setup(destination: String, alert_url: Option<String>) -> (Arc<AppState>
         .await
         .unwrap();
     db.migrate().await.unwrap();
-    sqlx::query("TRUNCATE delivery_attempts, deliveries, events CASCADE")
+    sqlx::query("TRUNCATE delivery_attempts, deliveries, events, routes CASCADE")
         .execute(&db.pool)
         .await
         .unwrap();
