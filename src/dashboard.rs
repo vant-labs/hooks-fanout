@@ -1,4 +1,4 @@
-use std::sync::Arc;
+use std::{net::IpAddr, sync::Arc};
 
 use askama::Template;
 use axum::{
@@ -137,6 +137,7 @@ struct EventsPage {
 struct EventDetailPage {
     user: SessionUser,
     detail: EventDetail,
+    routes: Vec<RouteView>,
     raw_body: String,
     headers_json: String,
     csrf: String,
@@ -205,6 +206,9 @@ struct RouteEditor {
     timeout_seconds: i32,
     max_attempts: i32,
     enabled: bool,
+    outbound_auth_mode: String,
+    outbound_auth_header: String,
+    outbound_auth_secret_present: bool,
     editing: bool,
 }
 
@@ -221,6 +225,9 @@ impl Default for RouteEditor {
             timeout_seconds: 10,
             max_attempts: 10,
             enabled: true,
+            outbound_auth_mode: "none".to_owned(),
+            outbound_auth_header: String::new(),
+            outbound_auth_secret_present: false,
             editing: false,
         }
     }
@@ -271,6 +278,10 @@ struct RouteForm {
     timeout_seconds: i32,
     max_attempts: i32,
     enabled: Option<String>,
+    #[serde(default)]
+    outbound_auth_mode: String,
+    outbound_auth_header: Option<String>,
+    outbound_auth_secret: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -350,7 +361,8 @@ async fn login_submit(
     Form(form): Form<LoginForm>,
 ) -> Response {
     let key = form.email.trim().to_ascii_lowercase();
-    if login_blocked(&state, &key) {
+    let limit_key = login_limit_key(&state, &headers, &key);
+    if login_blocked(&state, &limit_key) {
         return render(LoginPage {
             error: Some("Too many attempts. Try again shortly.".to_owned()),
         });
@@ -374,7 +386,7 @@ async fn login_submit(
             })
     });
     if !valid {
-        login_failed(&state, &key);
+        login_failed(&state, &limit_key);
         return render(LoginPage {
             error: Some("Email or password is incorrect.".to_owned()),
         });
@@ -654,9 +666,16 @@ async fn event_detail(
     let Some(user) = require_user(&state, &headers).await else {
         return Redirect::to("/login").into_response();
     };
+    if !user.role.can_write() {
+        return (StatusCode::FORBIDDEN, "Admin or owner access is required").into_response();
+    }
     let detail = match state.db.get_event(id).await {
         Ok(Some(detail)) => detail,
         Ok(None) => return (StatusCode::NOT_FOUND, "Event not found").into_response(),
+        Err(error) => return server_error(error),
+    };
+    let routes = match state.db.list_routes().await {
+        Ok(routes) => routes,
         Err(error) => return server_error(error),
     };
     let raw_body = serde_json::from_str::<Value>(&detail.raw_body)
@@ -664,11 +683,13 @@ async fn event_detail(
         .and_then(|value| serde_json::to_string_pretty(&value).ok())
         .unwrap_or_else(|| detail.raw_body.clone());
     let headers_json =
-        serde_json::to_string_pretty(&detail.headers).unwrap_or_else(|_| "{}".to_owned());
+        serde_json::to_string_pretty(&crate::db::mask_sensitive_headers(&detail.headers))
+            .unwrap_or_else(|_| "{}".to_owned());
     render(EventDetailPage {
         user,
         csrf: current_csrf(&state, &headers).await.unwrap_or_default(),
         detail,
+        routes,
         raw_body,
         headers_json,
     })
@@ -812,6 +833,10 @@ async fn export_events(
     let Some(user) = require_user(&state, &headers).await else {
         return Redirect::to("/login").into_response();
     };
+    let include_raw = query.raw.unwrap_or(false);
+    if include_raw && !user.role.can_write() {
+        return (StatusCode::FORBIDDEN, "Admin or owner access is required").into_response();
+    }
     let _ = state
         .db
         .audit(
@@ -827,7 +852,6 @@ async fn export_events(
             None,
         )
         .await;
-    let include_raw = query.raw.unwrap_or(false);
     let rows = state.db.clone().export_events(
         query.status.clone(),
         query.route.clone(),
@@ -888,10 +912,15 @@ async fn export_events(
 }
 
 fn csv_field(value: &str) -> String {
+    let value = if matches!(value.chars().next(), Some('=' | '+' | '-' | '@')) {
+        format!("'{}", value)
+    } else {
+        value.to_owned()
+    };
     if value.contains([',', '"', '\n', '\r']) {
         format!("\"{}\"", value.replace('"', "\"\""))
     } else {
-        value.to_owned()
+        value
     }
 }
 
@@ -1160,6 +1189,9 @@ async fn configuration(
             timeout_seconds: route.timeout_seconds,
             max_attempts: route.max_attempts,
             enabled: route.enabled,
+            outbound_auth_mode: route.outbound_auth_mode.clone(),
+            outbound_auth_header: route.outbound_auth_header.clone().unwrap_or_default(),
+            outbound_auth_secret_present: route.outbound_auth_secret_present,
             editing: true,
         })
         .unwrap_or_default();
@@ -1224,10 +1256,7 @@ async fn save_route(
         return (StatusCode::FORBIDDEN, "Action not permitted").into_response();
     }
     let name = form.name.trim();
-    if name.is_empty()
-        || !(form.destination_url.starts_with("https://")
-            || form.destination_url.starts_with("http://"))
-    {
+    if name.is_empty() || !crate::app::valid_public_http_url(&form.destination_url, true) {
         return (
             StatusCode::BAD_REQUEST,
             "Route name and an http(s) destination are required",
@@ -1252,6 +1281,33 @@ async fn save_route(
         )
             .into_response();
     }
+    let auth_mode = if form.outbound_auth_mode.trim().is_empty() {
+        "none"
+    } else {
+        form.outbound_auth_mode.trim()
+    };
+    if !matches!(auth_mode, "none" | "static_header" | "hmac_sha512") {
+        return (
+            StatusCode::BAD_REQUEST,
+            "Unsupported outbound authentication mode",
+        )
+            .into_response();
+    }
+    let auth_header = clean_option(form.outbound_auth_header);
+    if auth_mode != "none"
+        && !auth_header
+            .as_deref()
+            .is_some_and(crate::app::valid_outbound_header_name)
+    {
+        return (
+            StatusCode::BAD_REQUEST,
+            "A safe outbound header name is required",
+        )
+            .into_response();
+    }
+    let auth_secret = form
+        .outbound_auth_secret
+        .and_then(|value| (!value.trim().is_empty()).then(|| value.trim().to_owned()));
     let matcher = RouteMatcher::from_extended(ExtendedRouteMatcher {
         metadata_app: clean_option(form.metadata_app),
         plan_code_prefix: clean_option(form.plan_code_prefix),
@@ -1269,6 +1325,9 @@ async fn save_route(
             form.timeout_seconds,
             form.max_attempts,
             form.enabled.is_some(),
+            auth_mode,
+            auth_header.as_deref(),
+            auth_secret.as_deref(),
         )
         .await
     {
@@ -1370,6 +1429,13 @@ async fn save_source(
                 .into_response();
         }
     };
+    if !crate::app::valid_provider_config_urls(provider_config.as_ref()) {
+        return (
+            StatusCode::BAD_REQUEST,
+            "Provider api_base_url and token_url must be public HTTPS URLs",
+        )
+            .into_response();
+    }
     let credentials = match form
         .credentials
         .as_deref()
@@ -1526,6 +1592,21 @@ fn login_blocked(state: &AppState, key: &str) -> bool {
     }
 }
 
+fn login_limit_key(state: &AppState, headers: &HeaderMap, email: &str) -> String {
+    let client = if state.trust_proxy && !state.trusted_proxy_cidrs.is_empty() {
+        headers
+            .get("x-forwarded-for")
+            .and_then(|value| value.to_str().ok())
+            .and_then(|value| value.split(',').next())
+            .map(str::trim)
+            .filter(|value| value.parse::<IpAddr>().is_ok())
+            .map(str::to_owned)
+    } else {
+        None
+    };
+    client.unwrap_or_else(|| format!("email:{email}"))
+}
+
 fn login_failed(state: &AppState, key: &str) {
     let mut limits = state.login_limits.lock().expect("login limiter lock");
     let entry = limits
@@ -1561,4 +1642,18 @@ fn server_error(error: impl std::fmt::Display) -> Response {
         "Something went wrong. Try again.",
     )
         .into_response()
+}
+
+#[cfg(test)]
+mod csv_tests {
+    use super::csv_field;
+
+    #[test]
+    fn csv_formula_prefixes_are_neutralized() {
+        for value in ["=SUM(A1:A2)", "+1", "-1", "@cmd"] {
+            assert_eq!(csv_field(value), format!("'{}", value));
+        }
+        assert_eq!(csv_field("normal"), "normal");
+        assert_eq!(csv_field("=1,2"), "\"'=1,2\"");
+    }
 }

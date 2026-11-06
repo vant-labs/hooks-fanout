@@ -4,8 +4,9 @@ Maintained by Vant Inc.
 
 The service provides one durable webhook endpoint for a small set of products.
 It verifies each source with its provider adapter, stores the original request,
-and forwards the same bytes and authentication headers to the selected product
-endpoint. It is intended for one business account, not as a hosted
+and forwards the same bytes to the selected product endpoint. Outbound
+authentication is selected per route in the database. It is intended for one
+business account, not as a hosted
 multi-customer service.
 
 ## Architecture
@@ -30,9 +31,12 @@ flowchart LR
 
 The ingest path does only authentication, JSON field extraction, routing,
 transactional persistence, and acknowledgement. Forwarding never runs inline.
-Paystack destinations receive the original body and authentication headers,
-unchanged. Store destinations receive the normalized event contract while the
-original provider body remains retained in the event ledger. All deliveries
+Every delivery uses the original ingress body bytes. Existing Paystack routes
+continue to receive their provider headers. A route may instead replace an
+inbound header with a configured static value or a fresh HMAC-SHA512 hex value
+computed over those exact bytes. Store destinations therefore receive the
+original Google or Apple provider payload; Timamu parses it only after verifying
+the configured relay header. All deliveries
 include `X-Fanout-Event-Id` and `X-Fanout-Attempt`.
 
 The implemented source providers are `paystack`,
@@ -48,6 +52,8 @@ unchanged.
 ## Quick start
 
 ```sh
+git clone <your-fork-url> paystack-fanout
+cd paystack-fanout
 cp .env.example .env
 docker compose up -d postgres
 git config core.hooksPath .githooks
@@ -60,8 +66,9 @@ Set `DATABASE_URL`, `MASTER_ENCRYPTION_KEY`, and `ADMIN_BOOTSTRAP_TOKEN`, then r
 cargo run -- --role all
 ```
 
-The listener binds to `0.0.0.0` and uses `PORT`, defaulting to `8080`. The
-Paystack URL is `https://your-host/in/paystack_main`.
+The listener binds to `0.0.0.0` and uses `PORT`, defaulting to `8080`. Set
+`PUBLIC_BASE_URL` to the public HTTPS origin for your deployment. The Paystack
+URL is then `${PUBLIC_BASE_URL}/in/paystack_main`.
 
 For the browser console, set a 32-byte `MASTER_ENCRYPTION_KEY`, then create the
 first owner after migrations run:
@@ -92,8 +99,8 @@ Each source has an explicit path slug and displays the paste URL
 `GET/POST /admin/sources` and `PATCH/DELETE /admin/sources/{slug}`. Routes
 remain managed by the existing `/dashboard/config` page and
 `GET/POST /admin/routes`, `PATCH/DELETE /admin/routes/{name}` APIs.
-Set `PUBLIC_BASE_URL` when the dashboard should render a host other than the
-default `https://vant-way.up.railway.app`.
+Set `PUBLIC_BASE_URL` so the dashboard renders the correct public host and
+source paste URLs. Do not commit a live deployment hostname to a fork.
 
 ```toml
 [source.paystack_main]
@@ -103,16 +110,17 @@ allowed_ips = ["52.31.139.75", "52.49.173.169", "52.214.14.220"]
 
 [[route]]
 name = "timamu"
-destination_url = "https://api.timamu.app/v1/webhooks/paystack"
+destination_url = "https://your-destination.example/v1/webhooks/paystack"
 match = { metadata_app = "timamu", plan_code_prefix = "PLN_tm", reference_prefix = "tm_" }
 
 [fallback]
 mode = "unrouted"
 ```
 
-`allowed_ips = []` disables the allowlist for that source. `TRUST_PROXY=true`
-allows the first address in `X-Forwarded-For` to be checked; otherwise the TCP
-peer address is used. The request body limit is 256 KiB. `RETENTION_DAYS`
+`allowed_ips = []` disables the allowlist for that source. Set
+`TRUST_PROXY=true` only when the direct peer is in one of the CIDRs listed in
+`TRUSTED_PROXY_CIDRS`; only then is the first address in `X-Forwarded-For`
+checked. Otherwise the TCP peer address is used. The request body limit is 256 KiB. `RETENTION_DAYS`
 defaults to 45 days; delivery records are kept for 30 days
 and delivered event records follow the configured retention.
 
@@ -222,6 +230,30 @@ means adding another source/route row with its identifiers; it does not require
 new Fanout code or a new silo. An unknown identifier has no default app and is
 stored in the unrouted queue.
 
+### Fresh-fork setup checklist
+
+After the first boot, configure a new deployment in this order:
+
+1. Open `/login` and sign in with the first account created by
+   `cargo run -- create-owner --email you@example.com`, or call
+   `POST /admin/bootstrap` once with `ADMIN_BOOTSTRAP_TOKEN`.
+2. Open `/dashboard/config` and create one Source for each provider ingress.
+   The source slug becomes `/in/{slug}` and the dashboard shows the exact URL
+   to paste into Paystack, App Store Server Notifications, or Pub/Sub.
+3. Add a Route for each destination. Set the app identifier to the Apple
+   bundle ID or Google package name and set the environment when needed.
+4. Select the outbound authentication mode on that Route. Secrets are stored
+   encrypted, masked after saving, and can be replaced without a redeploy.
+5. Send a provider test notification, then inspect the event detail page. It
+   shows the original request, the response returned to the provider, the
+   routing decision, and downstream delivery attempts.
+
+Do not copy production URLs, provider secrets, service-account JSON, private
+keys, bearer tokens, or database credentials into a fork, issue, screenshot,
+fixture, README, or commit. Use placeholders such as
+`https://your-public-host.example` and `https://your-destination.example` in
+public documentation. Keep `.env` and downloaded credential files out of Git.
+
 ## How to tag payments
 
 Use one stable convention per product:
@@ -233,7 +265,49 @@ Use one stable convention per product:
   `PLN_sc...`.
 
 The router does not modify a payload or create a new signature. Each product
-continues to verify Paystack's signature itself.
+continues to verify Paystack's signature itself. For store routes, configure
+the outbound authentication mode in the Routes panel; do not rely on an
+inbound provider header as the relay credential.
+
+The OWASP-aligned review, evidence references, residual findings, and
+deployment-dependent controls are tracked in
+[`docs/security-report.md`](docs/security-report.md). It is an engineering
+review, not a certification or a substitute for production verification.
+
+### Route outbound authentication
+
+Routes support three database-backed modes:
+
+- `none` preserves existing route behavior.
+- `static_header` sends the literal encrypted secret as the configured header value.
+- `hmac_sha512` generates a new lowercase hexadecimal HMAC-SHA512 value for
+  every attempt over the exact stored body bytes.
+
+The Routes panel masks saved secrets and never returns them through the admin
+API. Leaving the secret blank while editing keeps the stored value. The
+configured header replaces any same-named inbound header, and unsafe transport
+headers are rejected. For a store relay, select `hmac_sha512`, enter
+`x-fanout-signature`, and use the secret configured by the receiving service.
+This is a deployment setting, not a Fanout default.
+
+Inbound `Authorization` headers are never copied to a destination or retained
+in the event header record. Provider credentials are used only for provider
+verification. Destination URLs must be public HTTP(S) endpoints without
+embedded credentials; redirects are disabled for outbound requests. If a
+deployment is behind a proxy, set `TRUST_PROXY=true` only with an explicit
+`TRUSTED_PROXY_CIDRS` allowlist.
+
+Every pull request runs formatting, lint, tests, Docker smoke checks, and a
+dependency advisory audit. The audit configuration contains one documented
+exception for the RSA test-only key generator; it is not part of the release
+binary. Keep test credentials synthetic and rotate any credential that is ever
+accidentally committed.
+
+Migration `0014_store_forward_contract.sql` adds encrypted route-auth columns
+and marks existing deliveries to forward original bodies. Existing routes stay
+in `none` mode until an administrator explicitly changes them. Configuration
+changes are read when a delivery is claimed, so queued retries use the current
+route setting without replaying stale authentication headers or redeploying.
 
 ## Paystack event fields
 
@@ -292,14 +366,20 @@ When `ADMIN_TOKEN` or `ADMIN_BOOTSTRAP_TOKEN` is set, send `Authorization: Beare
 - `GET /admin/settings`, `PUT /admin/settings/{key}`, and
   `DELETE /admin/settings/{key}`
 
-For example, add the Timamu route with both matching conventions:
+For example, add a store route with both matching conventions:
 
 ```sh
 curl -X POST "$APP_URL/admin/routes" \
   -H "Authorization: Bearer $ADMIN_TOKEN" \
   -H 'content-type: application/json' \
-  -d '{"name":"timamu","target_url":"https://api.timamu.app/v1/webhooks/paystack","ref_prefix":"tm_","metadata_app":"timamu","enabled":true}'
+  -d '{"name":"store-payments","target_url":"https://your-destination.example/v1/webhooks/paystack","ref_prefix":"app_","metadata_app":"your-app","enabled":true}'
 ```
+
+For a store route, the same API accepts `outbound_auth_mode`,
+`outbound_auth_header`, and write-only `outbound_auth_secret`; for example,
+use `"outbound_auth_mode":"hmac_sha512"` and
+`"outbound_auth_header":"x-fanout-signature"`. The response exposes only
+whether a secret is stored.
 
 When the token is unset, admin routes return 404. `/healthz` is liveness,
 `/readyz` checks the database, and `/metrics` exposes Prometheus text metrics
@@ -324,10 +404,9 @@ OpenAPI document at `/api-docs/openapi.json`.
    and password after the first deploy, then enable 2FA.
 6. Use the service public URL as the Paystack webhook URL in test mode.
 7. In Sources, create `google_production`, `apple_production`, and
-   `apple_sandbox` with their provider settings and encrypted credentials; the
-   paste URLs are `https://vant-way.up.railway.app/in/google_production`,
-   `https://vant-way.up.railway.app/in/apple_production`, and
-   `https://vant-way.up.railway.app/in/apple_sandbox` for the current service.
+   `apple_sandbox` with their provider settings and encrypted credentials. Use
+   the source URLs rendered by your dashboard, such as
+   `${PUBLIC_BASE_URL}/in/google_production`.
 8. Add routes and additional sources from the dashboard; no production route
    file or redeploy is required.
 
@@ -360,7 +439,8 @@ Pages are available after signing in:
 
 - `/admin` overview with 24-hour and seven-day queue health.
 - `/dashboard/events` filtered event ledger and streamed CSV or newline JSON exports.
-- `/dashboard/events/{id}` raw payload, masked headers, routing decision, and attempts.
+- `/dashboard/events/{id}` raw payload, masked request headers, response returned
+  to the provider, routing decision, and downstream attempts.
 - `/dashboard/retries` and `/dashboard/unrouted` operational queues.
 - `/dashboard/config` persisted sources, routes, encrypted write-only secrets, and matcher tests.
 - `/dashboard/users`, `/dashboard/audit`, and `/dashboard/settings` for access and policy.
@@ -379,6 +459,36 @@ Browser sessions use an HttpOnly, SameSite=Lax cookie, rotate on sign-in, and
 require a session-bound CSRF value on every mutating form. Passwords use
 Argon2id. Login attempts are rate limited per account, and an optional TOTP
 code is checked when a user has one configured.
+
+### Transport and browser security
+
+The application adds `X-Content-Type-Options: nosniff`,
+`Referrer-Policy: no-referrer`, `Content-Security-Policy: frame-ancestors
+'none'`, and `X-Frame-Options: DENY` to successful and error responses. The
+dashboard does not require framing or embedding and should be served as a
+top-level application.
+
+Terminate HTTPS at the trusted edge or reverse proxy and restrict direct
+access to the application port. Set `COOKIE_SECURE=true` (the default) for
+HTTPS deployments; session cookies then include `Secure`, `HttpOnly`, and
+`SameSite=Lax`. Local HTTP development may set `COOKIE_SECURE=false` only in a
+local environment.
+
+Enable HSTS at the TLS edge after the HTTPS deployment is verified, for example
+with `Strict-Transport-Security: max-age=31536000; includeSubDomains` when all
+covered subdomains are HTTPS-only. Do not enable HSTS blindly for local HTTP
+development.
+
+Set `TRUST_PROXY=true` only when the direct peer is a controlled proxy listed
+in `TRUSTED_PROXY_CIDRS`. Otherwise `X-Forwarded-For` is ignored and the TCP
+peer address is used. Do not expose the application port directly to the
+public internet when relying on forwarded client headers.
+
+Configured relay destinations and provider API endpoints are resolved at request
+time; private or local DNS results are rejected and the validated public address
+is pinned for that request. Keep deployment egress controls in place as a second
+line of defense. CSV exports neutralize formula-leading values; use NDJSON when
+spreadsheet import is not required.
 
 ### Screenshots
 

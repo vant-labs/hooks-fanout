@@ -36,22 +36,22 @@ service_account_key_env = "GOOGLE_SERVICE_ACCOUNT_JSON"
 
 [[route]]
 name = "timamu"
-destination_url = "https://api.timamu.app/v1/webhooks/paystack"
+destination_url = "https://your-destination.example/v1/webhooks/paystack"
 match = { metadata_app = "timamu", plan_code_prefix = "PLN_tm", reference_prefix = "tm_" }
 
 [[route]]
 name = "timamu_apple_production"
-destination_url = "https://api.timamu.app/v1/webhooks/apple"
+destination_url = "https://your-destination.example/v1/webhooks/apple"
 match = { provider = "apple", app_identifier = "com.vant.presslit.presslitMobile", environment = "production" }
 
 [[route]]
 name = "timamu_apple_sandbox"
-destination_url = "https://api.timamu.app/v1/webhooks/apple"
+destination_url = "https://your-destination.example/v1/webhooks/apple"
 match = { provider = "apple", app_identifier = "com.vant.presslit.presslitMobile", environment = "sandbox" }
 
 [[route]]
 name = "timamu_google_production"
-destination_url = "https://api.timamu.app/v1/webhooks/google"
+destination_url = "https://your-destination.example/v1/webhooks/google"
 match = { provider = "google", app_identifier = "com.vant.presslit.presslit_mobile", environment = "production" }
 
 [[route]]

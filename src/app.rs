@@ -5,13 +5,12 @@ use std::{
     time::Instant,
 };
 
-use anyhow::Context;
 use axum::{
     Json, Router,
     body::Bytes,
     extract::{ConnectInfo, OriginalUri, Path, Query, State},
     http::{HeaderMap, StatusCode, header},
-    response::{IntoResponse, Response},
+    response::{Html, IntoResponse, Redirect, Response},
     routing::{get, patch, post, put},
 };
 use chrono::{DateTime, Utc};
@@ -20,7 +19,6 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 use tokio::time::{Duration, sleep};
 use utoipa::{OpenApi, ToSchema};
-use utoipa_swagger_ui::SwaggerUi;
 use uuid::Uuid;
 
 use crate::{
@@ -45,6 +43,7 @@ pub struct AppState {
     pub metrics: Arc<Metrics>,
     pub http: reqwest::Client,
     pub trust_proxy: bool,
+    pub trusted_proxy_cidrs: Vec<ipnet::IpNet>,
     pub admin_token: Option<String>,
     pub bootstrap_token: Option<String>,
     pub purchase_jwt_secret: Option<String>,
@@ -61,6 +60,8 @@ pub struct AppState {
     pub runtime_alert_url: Arc<tokio::sync::RwLock<Option<String>>>,
     pub runtime_loaded_at: Arc<tokio::sync::RwLock<Instant>>,
     pub route_cache: Arc<tokio::sync::RwLock<RouteCache>>,
+    #[cfg(feature = "test-support")]
+    test_allow_private_outbound: bool,
     alert_url_override: Option<String>,
 }
 
@@ -83,9 +84,22 @@ impl AppState {
             metrics: Arc::new(Metrics::default()),
             http: reqwest::Client::builder()
                 .timeout(Duration::from_secs(10))
+                .redirect(reqwest::redirect::Policy::none())
                 .build()?,
             trust_proxy: std::env::var("TRUST_PROXY")
                 .is_ok_and(|value| value.eq_ignore_ascii_case("true")),
+            trusted_proxy_cidrs: std::env::var("TRUSTED_PROXY_CIDRS")
+                .ok()
+                .into_iter()
+                .flat_map(|value| {
+                    value
+                        .split(',')
+                        .map(str::trim)
+                        .map(str::to_owned)
+                        .collect::<Vec<_>>()
+                })
+                .filter_map(|value| value.parse().ok())
+                .collect(),
             admin_token: std::env::var("ADMIN_TOKEN").ok(),
             bootstrap_token: std::env::var("ADMIN_BOOTSTRAP_TOKEN")
                 .ok()
@@ -96,7 +110,7 @@ impl AppState {
             purchase_bearer_token: std::env::var("PURCHASE_BEARER_TOKEN").ok(),
             purchase_bearer_account_id: std::env::var("PURCHASE_BEARER_ACCOUNT_ID").ok(),
             timamu_api_base_url: std::env::var("TIMAMU_API_BASE_URL")
-                .unwrap_or_else(|_| "https://api.timamu.app".to_owned())
+                .unwrap_or_else(|_| "http://localhost:8080".to_owned())
                 .trim_end_matches('/')
                 .to_owned(),
             cookie_secure: std::env::var("COOKIE_SECURE")
@@ -109,8 +123,20 @@ impl AppState {
             runtime_alert_url: Arc::new(tokio::sync::RwLock::new(None)),
             runtime_loaded_at: Arc::new(tokio::sync::RwLock::new(Instant::now())),
             route_cache: Arc::new(tokio::sync::RwLock::new(None)),
+            #[cfg(feature = "test-support")]
+            test_allow_private_outbound: false,
             alert_url_override,
         })
+    }
+
+    #[cfg(feature = "test-support")]
+    pub fn enable_test_outbound_transport(&mut self) {
+        self.test_allow_private_outbound = true;
+    }
+
+    #[cfg(feature = "test-support")]
+    pub(crate) fn test_outbound_transport_enabled(&self) -> bool {
+        self.test_allow_private_outbound
     }
 
     pub async fn reload_runtime_config(&self) -> anyhow::Result<()> {
@@ -199,10 +225,9 @@ impl AppState {
 pub fn build_router(state: Arc<AppState>) -> Router {
     Router::new()
         .merge(crate::dashboard::router())
-        .merge(
-            SwaggerUi::new("/docs")
-                .url("/api-docs/openapi.json", crate::openapi::ApiDoc::openapi()),
-        )
+        .route("/docs", get(docs_redirect))
+        .route("/docs/", get(docs_page))
+        .route("/api-docs/openapi.json", get(openapi_document))
         .route("/in/{source}", post(ingest))
         .route("/v1/purchases/verify", post(verify_purchase))
         .route("/v1/entitlements", get(list_entitlements))
@@ -236,7 +261,54 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         )
         .route("/admin/bootstrap", post(bootstrap_admin))
         .layer(axum::extract::DefaultBodyLimit::max(256 * 1024))
+        .layer(axum::middleware::map_response(add_security_headers))
         .with_state(state)
+}
+
+async fn add_security_headers(mut response: Response) -> Response {
+    let headers = response.headers_mut();
+    headers.insert(
+        header::X_CONTENT_TYPE_OPTIONS,
+        axum::http::HeaderValue::from_static("nosniff"),
+    );
+    headers.insert(
+        header::REFERRER_POLICY,
+        axum::http::HeaderValue::from_static("no-referrer"),
+    );
+    headers.insert(
+        header::X_FRAME_OPTIONS,
+        axum::http::HeaderValue::from_static("DENY"),
+    );
+    let content_security_policy = headers
+        .get(header::CONTENT_SECURITY_POLICY)
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_owned)
+        .map(|value| {
+            if value.contains("frame-ancestors") {
+                value
+            } else {
+                format!("{value}; frame-ancestors 'none'")
+            }
+        })
+        .unwrap_or_else(|| "frame-ancestors 'none'".to_owned());
+    if let Ok(value) = axum::http::HeaderValue::from_str(&content_security_policy) {
+        headers.insert(header::CONTENT_SECURITY_POLICY, value);
+    }
+    response
+}
+
+async fn docs_redirect() -> Redirect {
+    Redirect::to("/docs/")
+}
+
+async fn docs_page() -> Html<&'static str> {
+    Html(
+        r#"<!doctype html><html lang="en"><head><meta charset="utf-8"><title>Swagger UI</title></head><body><main><h1>Swagger UI</h1><p>Open the <a href="/api-docs/openapi.json">OpenAPI document</a> in your API client or documentation viewer.</p></main></body></html>"#,
+    )
+}
+
+async fn openapi_document() -> Json<utoipa::openapi::OpenApi> {
+    Json(crate::openapi::ApiDoc::openapi())
 }
 
 #[derive(Debug, Clone, Default)]
@@ -353,6 +425,7 @@ pub(crate) async fn ingest(
     if !allowed_ip(
         source_config.allowed_ips.as_slice(),
         state.trust_proxy,
+        state.trusted_proxy_cidrs.as_slice(),
         &headers,
         Some(remote.0.ip()),
     ) {
@@ -544,7 +617,7 @@ pub(crate) async fn ingest(
         .unwrap_or_else(|| provider.dedupe_key(&payload, &body));
     let inserted = match state
         .db
-        .insert_event_with_provider_event_id_and_normalized_with_request(
+        .insert_event_with_provider_event_id_and_normalized_with_delivery_options(
             &source,
             &event_type,
             &body,
@@ -565,12 +638,14 @@ pub(crate) async fn ingest(
                 MatchSource::Fallback => "fallback",
             }),
             status,
+            database_route_id,
             decision
                 .route
                 .as_ref()
                 .map(|route| route.destination_url.as_str()),
             Some("POST"),
             Some(request_url.as_str()),
+            true,
         )
         .await
     {
@@ -621,6 +696,14 @@ pub(crate) async fn ingest(
                         ))
                         .await;
                 });
+            }
+            if let Err(error) = state
+                .db
+                .record_ingress_response(event_id, 200, &json!({}), b"")
+                .await
+            {
+                tracing::error!(error = %error, event_id = %event_id, "recording ingress response failed");
+                return StatusCode::INTERNAL_SERVER_ERROR.into_response();
             }
         }
     }
@@ -735,8 +818,10 @@ async fn verified_purchase_account_id(
     // second purchase credential. Introspect the already-authenticated
     // session at Timamu, then use only the returned account id for Fanout's
     // store-account binding.
-    let response = state
-        .http
+    let client = crate::security::public_http_client(&state.timamu_api_base_url, false)
+        .await
+        .map_err(|_| StatusCode::UNAUTHORIZED)?;
+    let response = client
         .get(format!("{}/v1/account/session", state.timamu_api_base_url))
         .bearer_auth(token)
         .send()
@@ -985,20 +1070,12 @@ async fn store_normalized_event(
     } else {
         "unrouted"
     };
-    let source_secret = state.runtime_secrets.read().await.get(source).cloned();
-    let secret = std::env::var("PAYSTACK_WEBHOOK_SECRET")
-        .ok()
-        .or(source_secret)
-        .or_else(|| std::env::var("PAYSTACK_SECRET_KEY").ok())
-        .context("Fanout forward secret is not configured")?;
-    let signature = crate::security::sign_forward(secret.as_bytes(), normalized_body);
     let headers = json!({
         "content-type": "application/json",
-        "x-fanout-signature": signature,
     });
     let inserted = state
         .db
-        .insert_event_with_provider_event_id_and_normalized(
+        .insert_event_with_provider_event_id_and_normalized_with_delivery_options(
             source,
             event.event_type(),
             raw_body,
@@ -1011,10 +1088,14 @@ async fn store_normalized_event(
             matched_route,
             Some("provider_verification"),
             status,
+            database_route_id,
             decision
                 .route
                 .as_ref()
                 .map(|route| route.destination_url.as_str()),
+            None,
+            None,
+            false,
         )
         .await?;
     if let InsertResult::Inserted { event_id } = inserted {
@@ -1036,13 +1117,19 @@ async fn store_normalized_event(
 fn allowed_ip(
     allowed: &[IpAddr],
     trust_proxy: bool,
+    trusted_proxy_cidrs: &[ipnet::IpNet],
     headers: &HeaderMap,
     remote: Option<IpAddr>,
 ) -> bool {
     if allowed.is_empty() {
         return true;
     }
-    let ip = if trust_proxy {
+    let ip = if trust_proxy
+        && remote.is_some_and(|address| {
+            trusted_proxy_cidrs
+                .iter()
+                .any(|network| network.contains(&address))
+        }) {
         headers
             .get("x-forwarded-for")
             .and_then(|value| value.to_str().ok())
@@ -1070,6 +1157,20 @@ fn headers_to_json(headers: &HeaderMap, provider: &dyn Provider) -> Value {
             .iter()
             .filter_map(|value| value.to_str().ok().map(str::to_owned))
             .collect::<Vec<_>>();
+        let values = if name.eq_ignore_ascii_case(header::AUTHORIZATION.as_str()) {
+            values
+                .into_iter()
+                .map(|value| {
+                    value
+                        .split_whitespace()
+                        .next()
+                        .map(|scheme| format!("{scheme} [redacted]"))
+                        .unwrap_or_else(|| "[redacted]".to_owned())
+                })
+                .collect::<Vec<_>>()
+        } else {
+            values
+        };
         if values.len() == 1 {
             object.insert(name.to_owned(), Value::String(values[0].clone()));
         } else if !values.is_empty() {
@@ -1244,7 +1345,7 @@ pub(crate) async fn get_event(
     headers: HeaderMap,
     Path(id): Path<Uuid>,
 ) -> Response {
-    if !api_authorized(&state, &headers, false).await {
+    if !api_authorized(&state, &headers, true).await {
         return StatusCode::NOT_FOUND.into_response();
     }
     match state.db.get_event(id).await {
@@ -1388,6 +1489,18 @@ fn valid_source_provider_settings(
             && service_account.is_some_and(|value| !value.is_empty()))
 }
 
+pub(crate) fn valid_provider_config_urls(
+    provider_config: Option<&HashMap<String, String>>,
+) -> bool {
+    provider_config.is_none_or(|values| {
+        ["api_base_url", "token_url"].iter().all(|key| {
+            values
+                .get(*key)
+                .is_none_or(|value| valid_public_http_url(value, false))
+        })
+    })
+}
+
 #[utoipa::path(
     get,
     path = "/admin/sources",
@@ -1448,6 +1561,12 @@ async fn save_api_source(
         return Err((
             StatusCode::BAD_REQUEST,
             "Google Play sources require audience and service_account".to_owned(),
+        ));
+    }
+    if !valid_provider_config_urls(provider_config) {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "provider api_base_url and token_url must be public HTTPS URLs".to_owned(),
         ));
     }
     state
@@ -1681,6 +1800,9 @@ pub(crate) struct RouteWriteBody {
     pub app_identifier: Option<String>,
     pub environment: Option<String>,
     pub enabled: Option<bool>,
+    pub outbound_auth_mode: Option<String>,
+    pub outbound_auth_header: Option<String>,
+    pub outbound_auth_secret: Option<String>,
 }
 
 fn valid_environment(environment: Option<&str>) -> bool {
@@ -1701,7 +1823,33 @@ pub(crate) struct BootstrapBody {
 }
 
 fn valid_https_target(value: &str) -> bool {
-    value.starts_with("https://") && value.len() > "https://".len()
+    valid_public_http_url(value, false)
+}
+
+fn valid_outbound_auth(mode: Option<&str>, header_name: Option<&str>) -> bool {
+    let mode = mode.unwrap_or("none");
+    matches!(mode, "none" | "static_header" | "hmac_sha512")
+        && (mode == "none" || header_name.map(valid_outbound_header_name).unwrap_or(false))
+}
+
+pub(crate) fn valid_outbound_header_name(value: &str) -> bool {
+    let lower = value.trim().to_ascii_lowercase();
+    !lower.is_empty()
+        && !matches!(
+            lower.as_str(),
+            "host"
+                | "content-length"
+                | "transfer-encoding"
+                | "connection"
+                | "te"
+                | "trailer"
+                | "upgrade"
+        )
+        && header::HeaderName::from_bytes(lower.as_bytes()).is_ok()
+}
+
+pub(crate) fn valid_public_http_url(value: &str, allow_http: bool) -> bool {
+    crate::security::valid_public_url_syntax(value, allow_http)
 }
 
 async fn api_authorized(state: &AppState, headers: &HeaderMap, write: bool) -> bool {
@@ -1794,6 +1942,10 @@ pub(crate) async fn create_admin_route(
             && body.plan_code_prefix.is_none()
             && body.app_identifier.is_none()
             && body.environment.is_none())
+        || !valid_outbound_auth(
+            body.outbound_auth_mode.as_deref(),
+            body.outbound_auth_header.as_deref(),
+        )
     {
         return (
             StatusCode::BAD_REQUEST,
@@ -1815,6 +1967,11 @@ pub(crate) async fn create_admin_route(
                 provider: None,
             },
             body.enabled.unwrap_or(true),
+            body.outbound_auth_mode.as_deref().unwrap_or("none"),
+            body.outbound_auth_header.as_deref(),
+            body.outbound_auth_secret
+                .as_deref()
+                .filter(|value| !value.trim().is_empty()),
         )
         .await
     {
@@ -1872,6 +2029,16 @@ pub(crate) async fn update_admin_route(
         )
             .into_response();
     }
+    if !valid_outbound_auth(
+        body.outbound_auth_mode.as_deref(),
+        body.outbound_auth_header.as_deref(),
+    ) {
+        return (
+            StatusCode::BAD_REQUEST,
+            "invalid outbound authentication configuration",
+        )
+            .into_response();
+    }
     match state
         .db
         .update_database_route_with_matcher(
@@ -1883,6 +2050,11 @@ pub(crate) async fn update_admin_route(
             body.app_identifier.as_deref().map(Some),
             body.environment.as_deref().map(Some),
             body.enabled,
+            body.outbound_auth_mode.as_deref(),
+            body.outbound_auth_header.as_deref().map(Some),
+            body.outbound_auth_secret
+                .as_deref()
+                .filter(|value| !value.trim().is_empty()),
         )
         .await
     {
@@ -2118,9 +2290,13 @@ pub async fn retention_loop(state: Arc<AppState>) {
 #[cfg(test)]
 mod tests {
     use base64::{Engine, engine::general_purpose::STANDARD};
+    use std::collections::HashMap;
+
     use serde_json::json;
 
-    use super::{apply_source_environment, provider_for};
+    use super::{
+        apply_source_environment, provider_for, valid_provider_config_urls, valid_public_http_url,
+    };
     use crate::{
         config::ExtendedRouteMatcher,
         provider::RoutingFields,
@@ -2181,5 +2357,47 @@ mod tests {
             &mut fields,
         );
         assert_eq!(fields.environment, None);
+    }
+
+    #[test]
+    fn outbound_urls_reject_credentials_and_private_targets() {
+        assert!(valid_public_http_url(
+            "https://destination.example/webhook",
+            false
+        ));
+        assert!(valid_public_http_url(
+            "http://destination.example/webhook",
+            true
+        ));
+        assert!(!valid_public_http_url("http://localhost/webhook", true));
+        assert!(!valid_public_http_url("https://127.0.0.1/webhook", false));
+        assert!(!valid_public_http_url(
+            "https://169.254.169.254/latest",
+            false
+        ));
+        assert!(!valid_public_http_url(
+            "https://user:pass@destination.example/",
+            false
+        ));
+        assert!(!valid_public_http_url(
+            "http://destination.example/webhook",
+            false
+        ));
+    }
+
+    #[test]
+    fn provider_config_urls_reject_private_or_http_endpoints() {
+        assert!(valid_provider_config_urls(Some(&HashMap::from([(
+            "api_base_url".to_owned(),
+            "https://api.example.test".to_owned(),
+        )]))));
+        assert!(!valid_provider_config_urls(Some(&HashMap::from([(
+            "token_url".to_owned(),
+            "http://127.0.0.1/token".to_owned(),
+        )]))));
+        assert!(valid_provider_config_urls(Some(&HashMap::from([(
+            "product_licence.example".to_owned(),
+            "plan".to_owned(),
+        )]))));
     }
 }

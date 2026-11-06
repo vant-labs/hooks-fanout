@@ -9,6 +9,19 @@ use crate::{app::AppState, db::ClaimedDelivery};
 
 pub const MAX_ATTEMPTS: i32 = 10;
 
+async fn delivery_http_client(
+    state: &AppState,
+    destination_url: &str,
+) -> anyhow::Result<reqwest::Client> {
+    #[cfg(not(feature = "test-support"))]
+    let _ = state;
+    #[cfg(feature = "test-support")]
+    if state.test_outbound_transport_enabled() {
+        return Ok(state.http.clone());
+    }
+    crate::security::public_http_client(destination_url, true).await
+}
+
 pub fn retry_delay(attempt: i32) -> Option<Duration> {
     match attempt {
         1 => Some(Duration::from_secs(30)),
@@ -40,10 +53,33 @@ pub async fn run_worker(state: Arc<AppState>) {
 pub async fn process_one(state: &AppState, delivery: ClaimedDelivery) {
     let started = Utc::now();
     let timer = Instant::now();
-    let mut request = state.http.post(&delivery.destination_url);
+    let client = match delivery_http_client(state, &delivery.destination_url).await {
+        Ok(client) => client,
+        Err(error) => {
+            finish_failure(
+                state,
+                &delivery,
+                started,
+                Utc::now(),
+                None,
+                None,
+                Some(&error.to_string()),
+                0,
+            )
+            .await;
+            return;
+        }
+    };
+    let mut request = client.post(&delivery.destination_url);
     let mut has_content_type = false;
+    let configured_header = delivery.outbound_auth_header.as_deref();
     if let Some(headers) = delivery.headers.as_object() {
         for (name, value) in headers {
+            if configured_header.is_some_and(|configured| name.eq_ignore_ascii_case(configured))
+                || name.eq_ignore_ascii_case("x-fanout-signature")
+            {
+                continue;
+            }
             if !forwardable_header(name) {
                 continue;
             }
@@ -72,9 +108,32 @@ pub async fn process_one(state: &AppState, delivery: ClaimedDelivery) {
     let request = request
         .header("x-fanout-event-id", fanout_event_id)
         .header("x-fanout-attempt", delivery.attempt.to_string())
-        .body(delivery.forward_body.clone())
-        .send()
-        .await;
+        .body(delivery.forward_body.clone());
+    let request = match outbound_auth_value(
+        delivery.outbound_auth_mode.as_deref(),
+        delivery.outbound_auth_header.as_deref(),
+        delivery.outbound_auth_secret.as_deref(),
+        &delivery.forward_body,
+    ) {
+        Ok(Some((header, value))) => request.header(header, value),
+        Ok(None) => request,
+        Err(error) => {
+            finish_failure(
+                state,
+                &delivery,
+                started,
+                Utc::now(),
+                None,
+                None,
+                Some(error),
+                0,
+            )
+            .await;
+            return;
+        }
+    }
+    .send()
+    .await;
     let latency_ms = i32::try_from(timer.elapsed().as_millis()).unwrap_or(i32::MAX);
     let finished = Utc::now();
     state
@@ -138,9 +197,7 @@ fn forwardable_header(name: &str) -> bool {
     matches!(
         name.to_ascii_lowercase().as_str(),
         "content-type"
-            | "authorization"
             | "x-paystack-signature"
-            | "x-fanout-signature"
             | "x-apple-signature"
             | "x-apple-notification-signature"
             | "x-apple-connect-signature"
@@ -202,6 +259,24 @@ fn jitter(delay: Duration) -> Duration {
     Duration::from_secs_f64(delay.as_secs_f64() * ratio)
 }
 
+fn outbound_auth_value(
+    mode: Option<&str>,
+    header: Option<&str>,
+    secret: Option<&str>,
+    body: &[u8],
+) -> Result<Option<(String, String)>, &'static str> {
+    let Some(mode) = mode else { return Ok(None) };
+    let (Some(header), Some(secret)) = (header, secret) else {
+        return Err("outbound authentication is incomplete");
+    };
+    let value = match mode {
+        "static_header" => secret.to_owned(),
+        "hmac_sha512" => crate::security::sign_forward(secret.as_bytes(), body),
+        _ => return Err("outbound authentication mode is unsupported"),
+    };
+    Ok(Some((header.to_owned(), value)))
+}
+
 async fn read_response_body(response: reqwest::Response) -> Option<String> {
     let mut bytes = Vec::with_capacity(2_048);
     let mut stream = response.bytes_stream();
@@ -227,5 +302,49 @@ mod tests {
         assert_eq!(retry_delay(3).unwrap().as_secs(), 600);
         assert_eq!(retry_delay(9).unwrap().as_secs(), 86_400);
         assert!(retry_delay(MAX_ATTEMPTS).is_none());
+    }
+
+    #[test]
+    fn hmac_auth_is_over_exact_forward_body() {
+        let body = b"{\"amount\":1}\n";
+        let (_, signature) = outbound_auth_value(
+            Some("hmac_sha512"),
+            Some("x-fanout-signature"),
+            Some("relay-secret"),
+            body,
+        )
+        .unwrap()
+        .unwrap();
+        assert!(crate::security::verify_signature(
+            b"relay-secret",
+            body,
+            Some(&signature)
+        ));
+        assert!(!crate::security::verify_signature(
+            b"relay-secret",
+            br#"{"amount":1}"#,
+            Some(&signature)
+        ));
+    }
+
+    #[test]
+    fn static_auth_preserves_literal_value() {
+        assert_eq!(
+            outbound_auth_value(
+                Some("static_header"),
+                Some("authorization"),
+                Some("Bearer literal"),
+                b"body"
+            )
+            .unwrap(),
+            Some(("authorization".into(), "Bearer literal".into()))
+        );
+    }
+
+    #[test]
+    fn inbound_authorization_is_never_forwarded() {
+        assert!(!forwardable_header("authorization"));
+        assert!(forwardable_header("x-paystack-signature"));
+        assert!(forwardable_header("x-apple-signature"));
     }
 }

@@ -385,7 +385,7 @@ mod tests {
         let mut c = config();
         c.route = vec![RouteConfig {
             name: "timamu-google".into(),
-            destination_url: "https://api.timamu.app/v1/webhooks/google".into(),
+            destination_url: "https://your-destination.example/v1/webhooks/google".into(),
             matcher: RouteMatcher::from_extended(ExtendedRouteMatcher {
                 provider: Some("google".into()),
                 app_identifier: Some("com.vant.presslit.presslit_mobile".into()),
@@ -526,6 +526,9 @@ mod tests {
                 ref_prefix: Some("tm_".into()),
                 metadata_app: Some("timamu".into()),
                 enabled: true,
+                outbound_auth_mode: "none".into(),
+                outbound_auth_header: None,
+                outbound_auth_secret_present: false,
             },
             DatabaseRoute {
                 id: uuid::Uuid::new_v4(),
@@ -534,6 +537,9 @@ mod tests {
                 ref_prefix: Some("sc_".into()),
                 metadata_app: Some("screencrafter".into()),
                 enabled: true,
+                outbound_auth_mode: "none".into(),
+                outbound_auth_header: None,
+                outbound_auth_secret_present: false,
             },
         ];
         assert_eq!(

@@ -8,12 +8,15 @@ authors = ["Abdulhakim Haliru <hakimkal@gmail.com>"]
 repository = "https://github.com/abdulhakim/paystack-fanout"
 readme = "README.md"
 
+[features]
+test-support = []
+
 [dependencies]
 anyhow = "1"
 aes-gcm = "0.10"
 async-trait = "0.1"
 argon2 = "0.5"
-askama = "0.12"
+askama = "0.16"
 axum = { version = "0.8", features = ["macros"] }
 base64 = "0.22"
 data-encoding = "2"
@@ -44,8 +47,8 @@ toml = "0.8"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 utoipa = { version = "5", features = ["uuid", "chrono"] }
-utoipa-swagger-ui = { version = "9", features = ["axum"] }
 uuid = { version = "1", features = ["serde", "v4"] }
+url = "2"
 x509-parser = { version = "0.18", features = ["verify"] }
 
 [dev-dependencies]

@@ -64,6 +64,30 @@ jobs:
         env:
           SQLX_OFFLINE: true
 
+  dependency-audit:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Install cargo-audit
+        run: cargo install cargo-audit --locked
+      - name: Audit dependencies
+        run: cargo audit
+
+  secret-scan:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Scan repository history
+        run: >-
+          docker run --rm
+          -v "${{ github.workspace }}:/repo:ro"
+          zricethezav/gitleaks:v8.24.3
+          detect --source=/repo --config=/repo/.gitleaks.toml
+          --no-banner --redact --exit-code 1
+
   tests:
     runs-on: ubuntu-latest
     services:
@@ -80,7 +104,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
-      - run: cargo test --all-targets
+      - run: cargo test --all-targets --all-features
         env:
           SQLX_OFFLINE: true
           DATABASE_URL: postgres://fanout:fanout@localhost:5432/fanout
@@ -153,6 +177,7 @@ jobs:
           ADMIN_BOOTSTRAP_TOKEN: bootstrap-ci
           COOKIE_SECURE: false
           TRUST_PROXY: true
+          TRUSTED_PROXY_CIDRS: 127.0.0.1/32
       - name: Wait for readiness
         run: timeout 60 bash -c 'until curl -fsS http://127.0.0.1:8080/readyz; do sleep 1; done'
       - name: Seed browser event
