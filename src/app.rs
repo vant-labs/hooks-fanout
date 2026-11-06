@@ -248,7 +248,40 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         )
         .route("/admin/bootstrap", post(bootstrap_admin))
         .layer(axum::extract::DefaultBodyLimit::max(256 * 1024))
+        .layer(axum::middleware::map_response(add_security_headers))
         .with_state(state)
+}
+
+async fn add_security_headers(mut response: Response) -> Response {
+    let headers = response.headers_mut();
+    headers.insert(
+        header::X_CONTENT_TYPE_OPTIONS,
+        axum::http::HeaderValue::from_static("nosniff"),
+    );
+    headers.insert(
+        header::REFERRER_POLICY,
+        axum::http::HeaderValue::from_static("no-referrer"),
+    );
+    headers.insert(
+        header::X_FRAME_OPTIONS,
+        axum::http::HeaderValue::from_static("DENY"),
+    );
+    let content_security_policy = headers
+        .get(header::CONTENT_SECURITY_POLICY)
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_owned)
+        .map(|value| {
+            if value.contains("frame-ancestors") {
+                value
+            } else {
+                format!("{value}; frame-ancestors 'none'")
+            }
+        })
+        .unwrap_or_else(|| "frame-ancestors 'none'".to_owned());
+    if let Ok(value) = axum::http::HeaderValue::from_str(&content_security_policy) {
+        headers.insert(header::CONTENT_SECURITY_POLICY, value);
+    }
+    response
 }
 
 async fn docs_redirect() -> Redirect {

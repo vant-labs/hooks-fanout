@@ -80,6 +80,27 @@ async fn request(
         .unwrap()
 }
 
+fn assert_security_headers(response: &axum::response::Response) {
+    assert_eq!(
+        response.headers().get("x-content-type-options").unwrap(),
+        "nosniff"
+    );
+    assert_eq!(
+        response.headers().get("referrer-policy").unwrap(),
+        "no-referrer"
+    );
+    assert_eq!(response.headers().get("x-frame-options").unwrap(), "DENY");
+    assert!(
+        response
+            .headers()
+            .get("content-security-policy")
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .contains("frame-ancestors 'none'")
+    );
+}
+
 async fn login(state: Arc<AppState>, email: &str, password: &str) -> (String, String) {
     let response = request(
         state.clone(),
@@ -127,6 +148,73 @@ async fn login_sets_session_and_rejects_missing_csrf() {
     )
     .await;
     assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+}
+
+#[tokio::test]
+#[serial]
+async fn security_headers_cover_dashboard_api_auth_failure_and_error_responses() {
+    if !can_run() {
+        return;
+    }
+    let (state, db) = setup().await;
+    db.create_owner(
+        "owner@example.com",
+        &hash_password("long secure password").unwrap(),
+    )
+    .await
+    .unwrap();
+
+    let login_page = request(state.clone(), "GET", "/login", None, None).await;
+    assert_eq!(login_page.status(), StatusCode::OK);
+    assert_security_headers(&login_page);
+
+    let login_response = request(
+        state.clone(),
+        "POST",
+        "/login",
+        None,
+        Some("email=owner%40example.com&password=long+secure+password"),
+    )
+    .await;
+    assert_eq!(login_response.status(), StatusCode::SEE_OTHER);
+    assert_security_headers(&login_response);
+    let set_cookie = login_response
+        .headers()
+        .get("set-cookie")
+        .unwrap()
+        .to_str()
+        .unwrap();
+    assert!(set_cookie.contains("Secure"));
+    assert!(set_cookie.contains("HttpOnly"));
+    assert!(set_cookie.contains("SameSite=Lax"));
+
+    let (cookie, _) = login(state.clone(), "owner@example.com", "long secure password").await;
+    let dashboard = request(state.clone(), "GET", "/admin", Some(&cookie), None).await;
+    assert_eq!(dashboard.status(), StatusCode::OK);
+    assert_security_headers(&dashboard);
+
+    let api_failure = request(state.clone(), "GET", "/admin/routes", None, None).await;
+    assert_eq!(api_failure.status(), StatusCode::UNAUTHORIZED);
+    assert_security_headers(&api_failure);
+
+    let api_success = request(state.clone(), "GET", "/healthz", None, None).await;
+    assert_eq!(api_success.status(), StatusCode::OK);
+    assert_security_headers(&api_success);
+
+    let auth_failure = request(
+        state.clone(),
+        "POST",
+        "/login",
+        None,
+        Some("email=owner%40example.com&password=wrong-password"),
+    )
+    .await;
+    assert_eq!(auth_failure.status(), StatusCode::OK);
+    assert_security_headers(&auth_failure);
+
+    let not_found = request(state, "GET", "/not-a-route", None, None).await;
+    assert_eq!(not_found.status(), StatusCode::NOT_FOUND);
+    assert_security_headers(&not_found);
 }
 
 #[tokio::test]
