@@ -117,9 +117,10 @@ match = { metadata_app = "timamu", plan_code_prefix = "PLN_tm", reference_prefix
 mode = "unrouted"
 ```
 
-`allowed_ips = []` disables the allowlist for that source. `TRUST_PROXY=true`
-allows the first address in `X-Forwarded-For` to be checked; otherwise the TCP
-peer address is used. The request body limit is 256 KiB. `RETENTION_DAYS`
+`allowed_ips = []` disables the allowlist for that source. Set
+`TRUST_PROXY=true` only when the direct peer is in one of the CIDRs listed in
+`TRUSTED_PROXY_CIDRS`; only then is the first address in `X-Forwarded-For`
+checked. Otherwise the TCP peer address is used. The request body limit is 256 KiB. `RETENTION_DAYS`
 defaults to 45 days; delivery records are kept for 30 days
 and delivered event records follow the configured retention.
 
@@ -283,6 +284,19 @@ configured header replaces any same-named inbound header, and unsafe transport
 headers are rejected. For a store relay, select `hmac_sha512`, enter
 `x-fanout-signature`, and use the secret configured by the receiving service.
 This is a deployment setting, not a Fanout default.
+
+Inbound `Authorization` headers are never copied to a destination or retained
+in the event header record. Provider credentials are used only for provider
+verification. Destination URLs must be public HTTP(S) endpoints without
+embedded credentials; redirects are disabled for outbound requests. If a
+deployment is behind a proxy, set `TRUST_PROXY=true` only with an explicit
+`TRUSTED_PROXY_CIDRS` allowlist.
+
+Every pull request runs formatting, lint, tests, Docker smoke checks, and a
+dependency advisory audit. The audit configuration contains one documented
+exception for the RSA test-only key generator; it is not part of the release
+binary. Keep test credentials synthetic and rotate any credential that is ever
+accidentally committed.
 
 Migration `0014_store_forward_contract.sql` adds encrypted route-auth columns
 and marks existing deliveries to forward original bodies. Existing routes stay

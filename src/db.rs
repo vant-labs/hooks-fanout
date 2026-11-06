@@ -89,14 +89,13 @@ pub fn mask_sensitive_headers(headers: &Value) -> Value {
                 continue;
             }
             match header {
-                Value::String(value) => {
-                    *header =
-                        Value::String(format!("{}…", value.chars().take(8).collect::<String>()));
+                Value::String(_) => {
+                    *header = Value::String("[redacted]".to_owned());
                 }
                 Value::Array(values) => {
                     for value in values {
                         if let Value::String(value) = value {
-                            *value = format!("{}…", value.chars().take(8).collect::<String>());
+                            *value = "[redacted]".to_owned();
                         }
                     }
                 }

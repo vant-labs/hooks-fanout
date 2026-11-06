@@ -1,0 +1,4 @@
+[advisories]
+# The RSA crate is used only by local provider-test key generation. It is not
+# compiled into release builds; production verification uses ring/jsonwebtoken.
+ignore = ["RUSTSEC-2023-0071"]

@@ -1,5 +1,6 @@
 use hmac::{Hmac, Mac};
 use sha2::{Digest, Sha256, Sha512};
+use std::net::IpAddr;
 use subtle::ConstantTimeEq;
 
 type HmacSha256 = Hmac<Sha256>;
@@ -55,6 +56,30 @@ pub fn bearer_matches(token: &str, provided: Option<&str>) -> bool {
         .into()
 }
 
+pub fn is_private_or_local_ip(address: IpAddr) -> bool {
+    match address {
+        IpAddr::V4(address) => {
+            address.is_loopback()
+                || address.is_private()
+                || address.is_link_local()
+                || address.is_unspecified()
+                || address.is_broadcast()
+        }
+        IpAddr::V6(address) => {
+            address.to_ipv4_mapped().is_some_and(|mapped| {
+                mapped.is_loopback()
+                    || mapped.is_private()
+                    || mapped.is_link_local()
+                    || mapped.is_unspecified()
+                    || mapped.is_broadcast()
+            }) || address.is_loopback()
+                || address.is_unique_local()
+                || address.is_unicast_link_local()
+                || address.is_unspecified()
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -100,6 +125,18 @@ mod tests {
             secret,
             body,
             Some("deadbeef")
+        ));
+    }
+
+    #[test]
+    fn private_and_local_addresses_are_rejected_for_outbound_requests() {
+        assert!(is_private_or_local_ip("127.0.0.1".parse().unwrap()));
+        assert!(is_private_or_local_ip("169.254.169.254".parse().unwrap()));
+        assert!(is_private_or_local_ip("10.0.0.1".parse().unwrap()));
+        assert!(is_private_or_local_ip("fd00::1".parse().unwrap()));
+        assert!(!is_private_or_local_ip("8.8.8.8".parse().unwrap()));
+        assert!(!is_private_or_local_ip(
+            "2001:4860:4860::8888".parse().unwrap()
         ));
     }
 }

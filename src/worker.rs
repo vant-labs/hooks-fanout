@@ -167,7 +167,6 @@ fn forwardable_header(name: &str) -> bool {
     matches!(
         name.to_ascii_lowercase().as_str(),
         "content-type"
-            | "authorization"
             | "x-paystack-signature"
             | "x-apple-signature"
             | "x-apple-notification-signature"
@@ -310,5 +309,12 @@ mod tests {
             .unwrap(),
             Some(("authorization".into(), "Bearer literal".into()))
         );
+    }
+
+    #[test]
+    fn inbound_authorization_is_never_forwarded() {
+        assert!(!forwardable_header("authorization"));
+        assert!(forwardable_header("x-paystack-signature"));
+        assert!(forwardable_header("x-apple-signature"));
     }
 }
