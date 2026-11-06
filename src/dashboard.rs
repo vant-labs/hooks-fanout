@@ -1,4 +1,4 @@
-use std::{net::IpAddr, sync::Arc};
+use std::{convert::Infallible, net::IpAddr, sync::Arc};
 
 use askama::Template;
 use axum::{
@@ -6,7 +6,10 @@ use axum::{
     body::{Body, Bytes},
     extract::{Path, Query, State},
     http::{HeaderMap, HeaderValue, StatusCode, header},
-    response::{Html, IntoResponse, Redirect, Response},
+    response::{
+        Html, IntoResponse, Redirect, Response,
+        sse::{Event, KeepAlive, Sse},
+    },
     routing::{get, post},
 };
 use futures_util::StreamExt;
@@ -32,6 +35,7 @@ pub fn router() -> Router<Arc<AppState>> {
         .route("/logout", post(logout))
         .route("/admin", get(overview))
         .route("/dashboard/events", get(events))
+        .route("/dashboard/events/live", get(events_live))
         .route("/dashboard/events/{id}", get(event_detail))
         .route("/dashboard/events/{id}/replay", post(replay))
         .route("/dashboard/events/{id}/retry", post(retry_now))
@@ -604,6 +608,52 @@ async fn events(
         events,
         filters,
     })
+}
+
+async fn events_live(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Query(filters): Query<EventFilters>,
+) -> Response {
+    if require_user(&state, &headers).await.is_none() {
+        return StatusCode::UNAUTHORIZED.into_response();
+    }
+
+    let stream = futures_util::stream::unfold(
+        (
+            state,
+            filters,
+            tokio::time::interval(std::time::Duration::from_secs(2)),
+        ),
+        |(state, filters, mut ticker)| async move {
+            ticker.tick().await;
+            let events = match state
+                .db
+                .list_events(
+                    filters.status.as_deref(),
+                    filters.route.as_deref(),
+                    filters.event_type.as_deref(),
+                    None,
+                    50,
+                    filters.offset(),
+                )
+                .await
+            {
+                Ok(events) => events,
+                Err(error) => {
+                    tracing::warn!(error = %error, "live dashboard event refresh failed");
+                    Vec::new()
+                }
+            };
+            let payload = serde_json::to_string(&serde_json::json!({"events": events}))
+                .unwrap_or_else(|_| "{\"events\":[]}".to_owned());
+            let event = Event::default().event("snapshot").data(payload);
+            Some((Ok::<Event, Infallible>(event), (state, filters, ticker)))
+        },
+    );
+    Sse::new(stream)
+        .keep_alive(KeepAlive::default())
+        .into_response()
 }
 
 async fn retries(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Response {

@@ -152,6 +152,34 @@ async fn login_sets_session_and_rejects_missing_csrf() {
 
 #[tokio::test]
 #[serial]
+async fn dashboard_event_stream_requires_a_session() {
+    if !can_run() {
+        return;
+    }
+    let (state, db) = setup().await;
+    db.create_owner(
+        "owner@example.com",
+        &hash_password("long secure password").unwrap(),
+    )
+    .await
+    .unwrap();
+    let unauthenticated = request(state.clone(), "GET", "/dashboard/events/live", None, None).await;
+    assert_eq!(unauthenticated.status(), StatusCode::UNAUTHORIZED);
+
+    let (cookie, _) = login(state.clone(), "owner@example.com", "long secure password").await;
+    let stream = request(state, "GET", "/dashboard/events/live", Some(&cookie), None).await;
+    assert_eq!(stream.status(), StatusCode::OK);
+    assert_eq!(
+        stream
+            .headers()
+            .get("content-type")
+            .and_then(|value| value.to_str().ok()),
+        Some("text/event-stream")
+    );
+}
+
+#[tokio::test]
+#[serial]
 async fn security_headers_cover_dashboard_api_auth_failure_and_error_responses() {
     if !can_run() {
         return;
