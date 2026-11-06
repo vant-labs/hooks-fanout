@@ -32,6 +32,10 @@ pub struct ClaimedDelivery {
     pub headers: Value,
     pub destination_url: String,
     pub max_attempts: i32,
+    pub forward_original_body: bool,
+    pub outbound_auth_mode: Option<String>,
+    pub outbound_auth_header: Option<String>,
+    pub outbound_auth_secret: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, ToSchema)]
@@ -219,6 +223,9 @@ pub struct RouteView {
     pub timeout_seconds: i32,
     pub max_attempts: i32,
     pub enabled: bool,
+    pub outbound_auth_mode: String,
+    pub outbound_auth_header: Option<String>,
+    pub outbound_auth_secret_present: bool,
 }
 
 #[derive(Debug, Clone, Serialize, ToSchema)]
@@ -229,6 +236,9 @@ pub struct DatabaseRoute {
     pub ref_prefix: Option<String>,
     pub metadata_app: Option<String>,
     pub enabled: bool,
+    pub outbound_auth_mode: String,
+    pub outbound_auth_header: Option<String>,
+    pub outbound_auth_secret_present: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -248,6 +258,9 @@ pub struct DatabaseRouteResponse {
     pub app_identifier: Option<String>,
     pub environment: Option<String>,
     pub enabled: bool,
+    pub outbound_auth_mode: String,
+    pub outbound_auth_header: Option<String>,
+    pub outbound_auth_secret_present: bool,
 }
 
 impl From<DatabaseRouteRecord> for DatabaseRouteResponse {
@@ -262,6 +275,9 @@ impl From<DatabaseRouteRecord> for DatabaseRouteResponse {
             app_identifier: record.matcher.app_identifier,
             environment: record.matcher.environment,
             enabled: record.route.enabled,
+            outbound_auth_mode: record.route.outbound_auth_mode.clone(),
+            outbound_auth_header: record.route.outbound_auth_header.clone(),
+            outbound_auth_secret_present: record.route.outbound_auth_secret_present,
         }
     }
 }
@@ -712,7 +728,7 @@ impl Database {
     }
 
     pub async fn list_routes(&self) -> Result<Vec<RouteView>> {
-        let rows = sqlx::query("SELECT name, destination_url, matcher, app_identifier, environment, timeout_seconds, max_attempts, enabled FROM routes ORDER BY name")
+        let rows = sqlx::query("SELECT name, destination_url, matcher, app_identifier, environment, timeout_seconds, max_attempts, enabled, outbound_auth_mode, outbound_auth_header, outbound_auth_secret_ciphertext <> '' AS outbound_auth_secret_present FROM routes ORDER BY name")
             .fetch_all(&self.pool)
             .await?;
         rows.into_iter()
@@ -736,6 +752,9 @@ impl Database {
                     timeout_seconds: row.try_get("timeout_seconds")?,
                     max_attempts: row.try_get("max_attempts")?,
                     enabled: row.try_get("enabled")?,
+                    outbound_auth_mode: row.try_get("outbound_auth_mode")?,
+                    outbound_auth_header: row.try_get("outbound_auth_header")?,
+                    outbound_auth_secret_present: row.try_get("outbound_auth_secret_present")?,
                 })
             })
             .collect::<Result<Vec<_>, sqlx::Error>>()
@@ -753,7 +772,7 @@ impl Database {
 
     pub async fn list_database_route_records(&self) -> Result<Vec<DatabaseRouteRecord>> {
         let rows = sqlx::query(
-            "SELECT id, name, COALESCE(target_url, destination_url) AS target_url, ref_prefix, metadata_app, app_identifier, environment, matcher, enabled FROM routes ORDER BY name",
+            "SELECT id, name, COALESCE(target_url, destination_url) AS target_url, ref_prefix, metadata_app, app_identifier, environment, matcher, enabled, outbound_auth_mode, outbound_auth_header, outbound_auth_secret_ciphertext <> '' AS outbound_auth_secret_present FROM routes ORDER BY name",
         )
         .fetch_all(&self.pool)
         .await?;
@@ -780,6 +799,10 @@ impl Database {
                         ref_prefix,
                         metadata_app,
                         enabled: row.try_get("enabled")?,
+                        outbound_auth_mode: row.try_get("outbound_auth_mode")?,
+                        outbound_auth_header: row.try_get("outbound_auth_header")?,
+                        outbound_auth_secret_present: row
+                            .try_get("outbound_auth_secret_present")?,
                     },
                     matcher,
                 })
@@ -824,16 +847,23 @@ impl Database {
                 ..ExtendedRouteMatcher::default()
             },
             enabled,
+            "none",
+            None,
+            None,
         )
         .await
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub async fn create_database_route_with_matcher(
         &self,
         name: &str,
         target_url: &str,
         matcher: &ExtendedRouteMatcher,
         enabled: bool,
+        auth_mode: &str,
+        auth_header: Option<&str>,
+        auth_secret: Option<&str>,
     ) -> Result<DatabaseRoute> {
         anyhow::ensure!(
             matcher.metadata_app.is_some()
@@ -843,9 +873,20 @@ impl Database {
                 || matcher.environment.is_some(),
             "at least one match rule is required"
         );
+        anyhow::ensure!(matches!(
+            auth_mode,
+            "none" | "static_header" | "hmac_sha512"
+        ));
+        anyhow::ensure!(auth_mode == "none" || auth_header.is_some());
+        let secret_present = auth_mode != "none" && auth_secret.is_some();
+        let encrypted_secret = if auth_mode == "none" {
+            Some(String::new())
+        } else {
+            auth_secret.map(encrypt).transpose()?
+        };
         let id = Uuid::new_v4();
         sqlx::query(
-            "INSERT INTO routes (id, name, destination_url, target_url, matcher, ref_prefix, metadata_app, app_identifier, environment, max_attempts, enabled, created_at, updated_at) VALUES ($1, $2, $3, $3, $4, $5, $6, $7, $8, 3, $9, now(), now())",
+            "INSERT INTO routes (id, name, destination_url, target_url, matcher, ref_prefix, metadata_app, app_identifier, environment, max_attempts, enabled, outbound_auth_mode, outbound_auth_header, outbound_auth_secret_ciphertext, created_at, updated_at) VALUES ($1, $2, $3, $3, $4, $5, $6, $7, $8, 3, $9, $10, $11, COALESCE($12, ''), now(), now())",
         )
         .bind(id)
         .bind(name)
@@ -856,6 +897,9 @@ impl Database {
         .bind(&matcher.app_identifier)
         .bind(&matcher.environment)
         .bind(enabled)
+        .bind(auth_mode)
+        .bind(auth_header)
+        .bind(encrypted_secret)
         .execute(&self.pool)
         .await?;
         Ok(DatabaseRoute {
@@ -865,6 +909,9 @@ impl Database {
             ref_prefix: matcher.reference_prefix.clone(),
             metadata_app: matcher.metadata_app.clone(),
             enabled,
+            outbound_auth_mode: auth_mode.to_owned(),
+            outbound_auth_header: auth_header.map(str::to_owned),
+            outbound_auth_secret_present: secret_present,
         })
     }
 
@@ -885,6 +932,9 @@ impl Database {
             None,
             None,
             enabled,
+            None,
+            None,
+            None,
         )
         .await
     }
@@ -900,6 +950,9 @@ impl Database {
         app_identifier: Option<Option<&str>>,
         environment: Option<Option<&str>>,
         enabled: Option<bool>,
+        auth_mode: Option<&str>,
+        auth_header: Option<Option<&str>>,
+        auth_secret: Option<&str>,
     ) -> Result<Option<DatabaseRoute>> {
         let current = self.find_database_route_record(name).await?;
         let Some(current) = current else {
@@ -923,6 +976,18 @@ impl Database {
             matcher.environment = value.map(str::to_owned);
         }
         let enabled = enabled.unwrap_or(current.route.enabled);
+        let auth_mode = auth_mode.unwrap_or(&current.route.outbound_auth_mode);
+        let auth_header = auth_header.unwrap_or(current.route.outbound_auth_header.as_deref());
+        anyhow::ensure!(matches!(
+            auth_mode,
+            "none" | "static_header" | "hmac_sha512"
+        ));
+        anyhow::ensure!(auth_mode == "none" || auth_header.is_some());
+        let encrypted_secret = if auth_mode == "none" {
+            Some(String::new())
+        } else {
+            auth_secret.map(encrypt).transpose()?
+        };
         anyhow::ensure!(
             matcher.metadata_app.is_some()
                 || matcher.plan_code_prefix.is_some()
@@ -932,7 +997,7 @@ impl Database {
             "at least one match rule is required"
         );
         sqlx::query(
-            "UPDATE routes SET destination_url = $2, target_url = $2, matcher = $3, ref_prefix = $4, metadata_app = $5, app_identifier = $6, environment = $7, enabled = $8, updated_at = now() WHERE name = $1",
+            "UPDATE routes SET destination_url = $2, target_url = $2, matcher = $3, ref_prefix = $4, metadata_app = $5, app_identifier = $6, environment = $7, enabled = $8, outbound_auth_mode = $9, outbound_auth_header = $10, outbound_auth_secret_ciphertext = CASE WHEN $11 THEN COALESCE($12, '') ELSE outbound_auth_secret_ciphertext END, updated_at = now() WHERE name = $1",
         )
         .bind(name)
         .bind(target_url)
@@ -942,6 +1007,10 @@ impl Database {
         .bind(matcher.app_identifier.as_deref())
         .bind(matcher.environment.as_deref())
         .bind(enabled)
+        .bind(auth_mode)
+        .bind(auth_header)
+        .bind(auth_mode == "none" || auth_secret.is_some())
+        .bind(encrypted_secret)
         .execute(&self.pool)
         .await?;
         Ok(Some(DatabaseRoute {
@@ -951,6 +1020,10 @@ impl Database {
             ref_prefix: matcher.reference_prefix,
             metadata_app: matcher.metadata_app,
             enabled,
+            outbound_auth_mode: auth_mode.to_owned(),
+            outbound_auth_header: auth_header.map(str::to_owned),
+            outbound_auth_secret_present: auth_mode != "none"
+                && (auth_secret.is_some() || current.route.outbound_auth_secret_present),
         }))
     }
 
@@ -1120,6 +1193,7 @@ impl Database {
         Ok(settings)
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub async fn save_route(
         &self,
         name: &str,
@@ -1128,9 +1202,18 @@ impl Database {
         timeout_seconds: i32,
         max_attempts: i32,
         enabled: bool,
+        auth_mode: &str,
+        auth_header: Option<&str>,
+        auth_secret: Option<&str>,
     ) -> Result<()> {
+        anyhow::ensure!(matches!(
+            auth_mode,
+            "none" | "static_header" | "hmac_sha512"
+        ));
+        anyhow::ensure!(auth_mode == "none" || auth_header.is_some());
+        let encrypted_secret = auth_secret.map(encrypt).transpose()?;
         let extended_matcher = matcher.extended();
-        sqlx::query("INSERT INTO routes (id, name, destination_url, target_url, matcher, ref_prefix, metadata_app, app_identifier, environment, timeout_seconds, max_attempts, enabled, created_at, updated_at) VALUES ($1, $2, $3, $3, $4, $5, $6, $7, $8, $9, $10, $11, now(), now()) ON CONFLICT (name) DO UPDATE SET destination_url = EXCLUDED.destination_url, target_url = EXCLUDED.target_url, matcher = EXCLUDED.matcher, ref_prefix = EXCLUDED.ref_prefix, metadata_app = EXCLUDED.metadata_app, app_identifier = EXCLUDED.app_identifier, environment = EXCLUDED.environment, timeout_seconds = EXCLUDED.timeout_seconds, max_attempts = EXCLUDED.max_attempts, enabled = EXCLUDED.enabled, updated_at = now()")
+        sqlx::query("INSERT INTO routes (id, name, destination_url, target_url, matcher, ref_prefix, metadata_app, app_identifier, environment, timeout_seconds, max_attempts, enabled, outbound_auth_mode, outbound_auth_header, outbound_auth_secret_ciphertext, created_at, updated_at) VALUES ($1, $2, $3, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, COALESCE($14, ''), now(), now()) ON CONFLICT (name) DO UPDATE SET destination_url = EXCLUDED.destination_url, target_url = EXCLUDED.target_url, matcher = EXCLUDED.matcher, ref_prefix = EXCLUDED.ref_prefix, metadata_app = EXCLUDED.metadata_app, app_identifier = EXCLUDED.app_identifier, environment = EXCLUDED.environment, timeout_seconds = EXCLUDED.timeout_seconds, max_attempts = EXCLUDED.max_attempts, enabled = EXCLUDED.enabled, outbound_auth_mode = EXCLUDED.outbound_auth_mode, outbound_auth_header = EXCLUDED.outbound_auth_header, outbound_auth_secret_ciphertext = CASE WHEN $15 THEN EXCLUDED.outbound_auth_secret_ciphertext ELSE routes.outbound_auth_secret_ciphertext END, updated_at = now()")
             .bind(Uuid::new_v4())
             .bind(name)
             .bind(destination_url)
@@ -1142,6 +1225,10 @@ impl Database {
             .bind(timeout_seconds)
             .bind(max_attempts)
             .bind(enabled)
+            .bind(auth_mode)
+            .bind(auth_header)
+            .bind(encrypted_secret)
+            .bind(auth_mode == "none" || auth_secret.is_some())
             .execute(&self.pool)
             .await?;
         Ok(())
@@ -1559,7 +1646,7 @@ impl Database {
         status: &str,
         destination_url: Option<&str>,
     ) -> Result<InsertResult> {
-        self.insert_event_with_provider_event_id_and_normalized_with_request(
+        self.insert_event_with_provider_event_id_and_normalized_with_delivery_options(
             source,
             event_type,
             raw_body,
@@ -1575,12 +1662,13 @@ impl Database {
             destination_url,
             None,
             None,
+            normalized_body.is_none(),
         )
         .await
     }
 
     #[allow(clippy::too_many_arguments)]
-    pub async fn insert_event_with_provider_event_id_and_normalized_with_request(
+    pub async fn insert_event_with_provider_event_id_and_normalized_with_delivery_options(
         &self,
         source: &str,
         event_type: &str,
@@ -1597,6 +1685,7 @@ impl Database {
         destination_url: Option<&str>,
         request_method: Option<&str>,
         request_url: Option<&str>,
+        forward_original_body: bool,
     ) -> Result<InsertResult> {
         let event_id = Uuid::new_v4();
         let delivery_id = Uuid::new_v4();
@@ -1639,6 +1728,11 @@ impl Database {
             )
             .execute(&mut *tx)
             .await?;
+            sqlx::query("UPDATE deliveries SET forward_original_body = $2 WHERE id = $1")
+                .bind(delivery_id)
+                .bind(forward_original_body)
+                .execute(&mut *tx)
+                .await?;
         }
         tx.commit().await?;
         Ok(InsertResult::Inserted { event_id })
@@ -1850,7 +1944,12 @@ impl Database {
     pub async fn claim_delivery(&self) -> Result<Option<ClaimedDelivery>> {
         let mut tx = self.pool.begin().await?;
         let row = sqlx::query(
-            r#"SELECT d.id as delivery_id, d.event_id, d.attempts, e.raw_body, COALESCE(e.normalized_body, e.raw_body) AS forward_body, e.content_type, e.signature, e.provider_event_id, e.headers, d.destination_url, COALESCE(r.max_attempts, 10) AS max_attempts
+            r#"SELECT d.id as delivery_id, d.event_id, d.attempts, e.raw_body,
+                      CASE WHEN d.forward_original_body THEN e.raw_body ELSE COALESCE(e.normalized_body, e.raw_body) END AS forward_body,
+                      e.content_type, e.signature, e.provider_event_id, e.headers, d.destination_url,
+                      COALESCE(r.max_attempts, 10) AS max_attempts,
+                      d.forward_original_body, r.outbound_auth_mode, r.outbound_auth_header,
+                      r.outbound_auth_secret_ciphertext
                FROM deliveries d JOIN events e ON e.id = d.event_id
                LEFT JOIN routes r ON r.id = d.route_id
                WHERE ((d.status IN ('pending', 'retrying') AND d.next_attempt_at <= now())
@@ -1883,6 +1982,15 @@ impl Database {
             headers: row.try_get("headers")?,
             destination_url: row.try_get("destination_url")?,
             max_attempts: row.try_get("max_attempts")?,
+            forward_original_body: row.try_get("forward_original_body")?,
+            outbound_auth_mode: row
+                .try_get::<Option<String>, _>("outbound_auth_mode")?
+                .filter(|mode| mode != "none"),
+            outbound_auth_header: row.try_get("outbound_auth_header")?,
+            outbound_auth_secret: row
+                .try_get::<Option<String>, _>("outbound_auth_secret_ciphertext")?
+                .filter(|value| !value.is_empty())
+                .and_then(|value| decrypt(&value).ok()),
         }))
     }
 

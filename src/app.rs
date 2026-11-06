@@ -5,7 +5,6 @@ use std::{
     time::Instant,
 };
 
-use anyhow::Context;
 use axum::{
     Json, Router,
     body::Bytes,
@@ -538,7 +537,7 @@ pub(crate) async fn ingest(
         .unwrap_or_else(|| provider.dedupe_key(&payload, &body));
     let inserted = match state
         .db
-        .insert_event_with_provider_event_id_and_normalized_with_request(
+        .insert_event_with_provider_event_id_and_normalized_with_delivery_options(
             &source,
             &event_type,
             &body,
@@ -565,6 +564,7 @@ pub(crate) async fn ingest(
                 .map(|route| route.destination_url.as_str()),
             Some("POST"),
             Some(request_url.as_str()),
+            true,
         )
         .await
     {
@@ -948,20 +948,12 @@ async fn store_normalized_event(
     } else {
         "unrouted"
     };
-    let source_secret = state.runtime_secrets.read().await.get(source).cloned();
-    let secret = std::env::var("PAYSTACK_WEBHOOK_SECRET")
-        .ok()
-        .or(source_secret)
-        .or_else(|| std::env::var("PAYSTACK_SECRET_KEY").ok())
-        .context("Fanout forward secret is not configured")?;
-    let signature = crate::security::sign_forward(secret.as_bytes(), normalized_body);
     let headers = json!({
         "content-type": "application/json",
-        "x-fanout-signature": signature,
     });
     let inserted = state
         .db
-        .insert_event_with_provider_event_id_and_normalized(
+        .insert_event_with_provider_event_id_and_normalized_with_delivery_options(
             source,
             event.event_type(),
             raw_body,
@@ -978,6 +970,9 @@ async fn store_normalized_event(
                 .route
                 .as_ref()
                 .map(|route| route.destination_url.as_str()),
+            None,
+            None,
+            false,
         )
         .await?;
     if let InsertResult::Inserted { event_id } = inserted {
@@ -1644,6 +1639,9 @@ pub(crate) struct RouteWriteBody {
     pub app_identifier: Option<String>,
     pub environment: Option<String>,
     pub enabled: Option<bool>,
+    pub outbound_auth_mode: Option<String>,
+    pub outbound_auth_header: Option<String>,
+    pub outbound_auth_secret: Option<String>,
 }
 
 fn valid_environment(environment: Option<&str>) -> bool {
@@ -1665,6 +1663,28 @@ pub(crate) struct BootstrapBody {
 
 fn valid_https_target(value: &str) -> bool {
     value.starts_with("https://") && value.len() > "https://".len()
+}
+
+fn valid_outbound_auth(mode: Option<&str>, header_name: Option<&str>) -> bool {
+    let mode = mode.unwrap_or("none");
+    matches!(mode, "none" | "static_header" | "hmac_sha512")
+        && (mode == "none" || header_name.map(valid_outbound_header_name).unwrap_or(false))
+}
+
+pub(crate) fn valid_outbound_header_name(value: &str) -> bool {
+    let lower = value.trim().to_ascii_lowercase();
+    !lower.is_empty()
+        && !matches!(
+            lower.as_str(),
+            "host"
+                | "content-length"
+                | "transfer-encoding"
+                | "connection"
+                | "te"
+                | "trailer"
+                | "upgrade"
+        )
+        && header::HeaderName::from_bytes(lower.as_bytes()).is_ok()
 }
 
 async fn api_authorized(state: &AppState, headers: &HeaderMap, write: bool) -> bool {
@@ -1757,6 +1777,10 @@ pub(crate) async fn create_admin_route(
             && body.plan_code_prefix.is_none()
             && body.app_identifier.is_none()
             && body.environment.is_none())
+        || !valid_outbound_auth(
+            body.outbound_auth_mode.as_deref(),
+            body.outbound_auth_header.as_deref(),
+        )
     {
         return (
             StatusCode::BAD_REQUEST,
@@ -1778,6 +1802,11 @@ pub(crate) async fn create_admin_route(
                 provider: None,
             },
             body.enabled.unwrap_or(true),
+            body.outbound_auth_mode.as_deref().unwrap_or("none"),
+            body.outbound_auth_header.as_deref(),
+            body.outbound_auth_secret
+                .as_deref()
+                .filter(|value| !value.trim().is_empty()),
         )
         .await
     {
@@ -1835,6 +1864,16 @@ pub(crate) async fn update_admin_route(
         )
             .into_response();
     }
+    if !valid_outbound_auth(
+        body.outbound_auth_mode.as_deref(),
+        body.outbound_auth_header.as_deref(),
+    ) {
+        return (
+            StatusCode::BAD_REQUEST,
+            "invalid outbound authentication configuration",
+        )
+            .into_response();
+    }
     match state
         .db
         .update_database_route_with_matcher(
@@ -1846,6 +1885,11 @@ pub(crate) async fn update_admin_route(
             body.app_identifier.as_deref().map(Some),
             body.environment.as_deref().map(Some),
             body.enabled,
+            body.outbound_auth_mode.as_deref(),
+            body.outbound_auth_header.as_deref().map(Some),
+            body.outbound_auth_secret
+                .as_deref()
+                .filter(|value| !value.trim().is_empty()),
         )
         .await
     {
