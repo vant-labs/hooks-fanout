@@ -1,127 +1,78 @@
-# paystack-fanout
+# Hooks Fanout
+
+[![CI](https://github.com/vant-labs/hooks-fanout/actions/workflows/ci.yml/badge.svg)](https://github.com/vant-labs/hooks-fanout/actions/workflows/ci.yml)
 
 Maintained by Vant Inc.
 
-The service provides one durable webhook endpoint for a small set of products.
-It verifies each source with its provider adapter, stores the original request,
-and forwards the same bytes to the selected product endpoint. Outbound
-authentication is selected per route in the database. It is intended for one
-business account, not as a hosted
-multi-customer service.
+One durable webhook ingress for a single business account. It verifies Paystack, Apple, and Google Play notifications, stores the original request, and forwards those same bytes to the product endpoint selected by your routes.
 
-## Architecture
+Formerly Paystack Fanout. The GitHub repository moved from `vant-labs/paystack-fanout` to `vant-labs/hooks-fanout` because this process already accepts more than Paystack. The rename covers the repository only. The Rust package, release binary, and container entrypoint remain `paystack-fanout`. Provider ids, the default source slug `paystack_main`, header names, and environment variables are unchanged. The crate manifest still records `repository = "https://github.com/abdulhakim/paystack-fanout"`, and the OpenAPI document title remains `paystack-fanout API`.
+
+## The problem
+
+Paystack, App Store Server Notifications, App Store Connect, and Google Play each expect a URL, while several products may share one account. Hooks Fanout is that URL. Ingress checks the provider, writes the event to Postgres, and acknowledges the caller. A worker then delivers the stored body. Products keep their own endpoints and, for Paystack, their own signature check.
+
+Sources, routes, and secrets for that one deployment live in Postgres and can be changed from the dashboard after the first boot.
 
 ```mermaid
 flowchart LR
-    P[Paystack] -->|raw POST| I["POST /in/{source}"]
-    AS[Apple Server Notifications V2] --> I
+    P[Paystack] -->|raw POST| I["POST /in/{slug}"]
+    AS[App Store Server Notifications V2] --> I
     GP[Google Play RTDN] --> I
     AC[App Store Connect webhooks] --> I
-    I --> V[Provider auth + IP check]
+    I --> V[Provider verification]
     V --> D[(Postgres events)]
     D --> Q[(Postgres deliveries)]
-    Q --> W[Tokio delivery worker]
-    W --> T[Timamu webhook]
-    W --> S[ScreenCrafter webhook]
-    W --> A[Alert webhook]
+    Q --> W[Delivery worker]
+    W --> T[Configured HTTPS routes]
     D --> AD[Bearer admin API]
-    B[Browser console] --> H[Cookie session + CSRF]
+    B[Browser console] --> H[Cookie session]
     H --> AD
 ```
 
-The ingest path does only authentication, JSON field extraction, routing,
-transactional persistence, and acknowledgement. Forwarding never runs inline.
-Every delivery uses the original ingress body bytes. Existing Paystack routes
-continue to receive their provider headers. A route may instead replace an
-inbound header with a configured static value or a fresh HMAC-SHA512 hex value
-computed over those exact bytes. Store destinations therefore receive the
-original Google or Apple provider payload; Timamu parses it only after verifying
-the configured relay header. All deliveries
-include `X-Fanout-Event-Id` and `X-Fanout-Attempt`.
+## Providers
 
-The implemented source providers are `paystack`,
-`apple_server_notifications`, `apple_connect_webhooks`, and
-`google_play_rtdn`.
+Configure a source with one of these provider ids. `known_providers()` is what config validation accepts.
 
-Store purchases use the same provider boundary and the same Postgres event,
-deduplication, outbox and delivery queue. Store adapters emit the normalized
-event types `purchase`, `renew`, `cancel`, `expire`, `grace`, `refund`, `revoke`,
-`upgrade`, and `downgrade`; Paystack payloads and delivery behavior remain
-unchanged.
+| Provider id | Ingress |
+| --- | --- |
+| `paystack` | JSON webhook. HMAC-SHA512 of the raw body in `x-paystack-signature`. An empty `allowed_ips` list accepts any peer; a non-empty list checks the TCP peer, or the first `X-Forwarded-For` address when `TRUST_PROXY=true` and that peer is inside `TRUSTED_PROXY_CIDRS`. |
+| `apple_server_notifications` | App Store Server Notifications V2. The signed payload is checked against the bundled Apple root at `src/certs/apple/AppleRootCA-G3.cer`. A shared secret is not required. |
+| `apple_connect_webhooks` | App Store Connect webhooks. `x-apple-signature` must be `hmacsha256=<hex>` over the raw body. |
+| `google_play_rtdn` | Google Play real-time developer notifications delivered as an authenticated Pub/Sub push. A shared webhook secret is not required. The source needs `audience` and `service_account`. |
 
-## Quick start
+`provider_for` also resolves the aliases `apple` to App Store Server Notifications and `google` or `google_play` to Google Play RTDN. Config validation and `POST /admin/sources` accept the four ids in the table, so use those when creating a source.
 
-```sh
-git clone <your-fork-url> paystack-fanout
-cd paystack-fanout
-cp .env.example .env
-docker compose up -d postgres
-git config core.hooksPath .githooks
-cargo test
-```
+Store notifications are mapped onto the shared kinds `purchase`, `renew`, `cancel`, `expire`, `grace`, `refund`, `revoke`, `upgrade`, and `downgrade`. Which kinds appear depends on the provider notification. Normalized store events set `provider` to `apple` or `google` for route matching. Paystack events keep the provider `event` string, and Paystack routing fields do not set `provider`. App Store Connect events keep the webhook `type` and `id` and are forwarded as the original body.
 
-Set `DATABASE_URL`, `MASTER_ENCRYPTION_KEY`, and `ADMIN_BOOTSTRAP_TOKEN`, then run:
+Setup for the store adapters is in [Apple App Store setup](docs/apple-store-setup.md) and [Google Play setup](docs/google-play-setup.md).
 
-```sh
-cargo run -- --role all
-```
+### App Store Connect webhooks
 
-The listener binds to `0.0.0.0` and uses `PORT`, defaulting to `8080`. Set
-`PUBLIC_BASE_URL` to the public HTTPS origin for your deployment. The Paystack
-URL is then `${PUBLIC_BASE_URL}/in/paystack_main`.
+Create a source with provider `apple_connect_webhooks`. The adapter checks the body with that source secret, then forwards the body and `x-apple-signature`. The event type is `type` or `eventType`, the event id is `id` or `eventId`, and `app_identifier` is taken from an app id or bundle id on the payload, including `data.attributes.appId`.
 
-For the browser console, set a 32-byte `MASTER_ENCRYPTION_KEY`, then create the
-first owner after migrations run:
+In App Store Connect, open Users and Access, then Integrations, then Webhooks. Use the payload URL `/in/{slug}`, choose the app, set a secret, and select triggers. Current fixture families are build upload state, app version state, beta feedback crash, and beta feedback screenshot. Match a route on `app_identifier`, or set the fallback to `route:<name>` for the whole source. Keep these routes apart from payment routes.
 
-```sh
-export MASTER_ENCRYPTION_KEY="$(openssl rand -hex 32)"
-cargo run -- create-owner --email owner@example.com
-```
+Apple's current signing notes: [Manage webhooks](https://developer.apple.com/help/app-store-connect/manage-your-team/manage-webhooks), [Configuring and parsing webhook notifications](https://developer.apple.com/documentation/appstoreconnectapi/configuring-webhook-notifications), and [WebhookEventType](https://developer.apple.com/documentation/appstoreconnectapi/webhookeventtype).
 
-The command prompts twice and never installs default credentials. Open
-`/login` to use the console. Set `COOKIE_SECURE=false` only for local HTTP
-development; production keeps secure cookies enabled by default.
+## Routing
 
-## Configuration
+The first matching route wins, in this order:
 
-`FANOUT_CONFIG` is optional and is used only as a first-boot seed. If it is
-unset or missing, the service starts with a Paystack source named
-`paystack_main`, no routes, and the default 45-day retention. Routes and
-sources are then managed in the dashboard and stored in Postgres. Source
-secrets and provider credentials are encrypted in Postgres; `secret_env` and
-`*_env` settings are legacy first-boot bootstrap names and are not required
-for runtime reloads. Start local development from
-[config.example.toml](config.example.toml).
+1. `data.metadata.app`, or a `data.metadata.custom_fields` item whose `variable_name` is `app`.
+2. Plan code prefix from `data.plan.plan_code`, `data.subscription.plan.plan_code`, or a string `data.plan`. For a normalized store event, the mapped licence is compared as the plan code.
+3. Prefix of `data.reference`, then `data.subscription_code`, then `data.customer_code`.
+4. `app_identifier`, compared with a bundle id or package name.
+5. `environment`, which must be `production` or `sandbox` when set.
+6. `provider`, compared with the normalized values `apple` or `google`.
 
-The dashboard’s Sources panel creates, edits, and disables ingress sources.
-Each source has an explicit path slug and displays the paste URL
-`https://your-host/in/{slug}`. The same operations are available through
-`GET/POST /admin/sources` and `PATCH/DELETE /admin/sources/{slug}`. Routes
-remain managed by the existing `/dashboard/config` page and
-`GET/POST /admin/routes`, `PATCH/DELETE /admin/routes/{name}` APIs.
-Set `PUBLIC_BASE_URL` so the dashboard renders the correct public host and
-source paste URLs. Do not commit a live deployment hostname to a fork.
+A route that sets both `app_identifier` and `environment` must match both. A configured `provider` must match as well. Legacy Paystack matchers are optional: a store route can omit `metadata_app` and the prefixes.
 
-### Live dashboard
+`fallback.mode = "unrouted"` stores the event with no delivery and sends an alert when an alert URL is configured. `fallback.mode = "route:<name>"` delivers to that route. Google Play RTDN fills a missing environment from the source configuration, or from a source slug that ends in `_production` or `_sandbox`.
 
-The Overview and Events pages update through authenticated Server-Sent Events
-(SSE); a browser reload is not required after an event arrives or a delivery
-status changes. The browser opens `/dashboard/overview/live` on Overview and
-`/dashboard/events/live` on Events using the existing secure session cookie.
-These endpoints are dashboard-only and are not provider or admin bearer APIs.
+Paystack refund examples use `transaction_reference` rather than `reference`. The router reads `reference`, `subscription_code`, and `customer_code`, so a refund needs `metadata.app`, a fallback, or another matching field. Paystack's public event shapes differ by family; the router does not decode one fixed event struct. Payloads are stored as raw bytes. Field names used by the matchers are documented by [Paystack webhooks](https://paystack.com/docs/payments/webhooks/), [subscriptions](https://paystack.com/docs/payments/subscriptions/), [charge](https://paystack.com/docs/api/charge/), [transfers](https://paystack.com/docs/transfers/single-transfers/), and [refunds](https://paystack.com/docs/payments/refunds/).
 
-The reverse proxy in front of the service must allow long-lived streaming
-responses and must not buffer `text/event-stream`. It must also preserve the
-session cookie and route these paths to the same application process. The
-client reconnects automatically after a network interruption. Static dashboard
-assets use a versioned URL and revalidation so a deployment does not leave an
-older dashboard script in the browser indefinitely.
-
-To verify a deployment, sign in, open the browser Network panel, and confirm
-that the relevant live endpoint remains HTTP 200 with content type
-`text/event-stream`. A `401` means the session cookie is missing or expired;
-an immediate `404` means the deployed application does not contain the live
-dashboard release yet.
+[config.example.toml](config.example.toml) is a first-boot seed with a Paystack source, sample routes, and store sources. The blocks below are copied from that file. They are not the whole file. Replace destination URLs and identifiers before use.
 
 ```toml
 [source.paystack_main]
@@ -138,43 +89,93 @@ match = { metadata_app = "timamu", plan_code_prefix = "PLN_tm", reference_prefix
 mode = "unrouted"
 ```
 
-`allowed_ips = []` disables the allowlist for that source. Set
-`TRUST_PROXY=true` only when the direct peer is in one of the CIDRs listed in
-`TRUSTED_PROXY_CIDRS`; only then is the first address in `X-Forwarded-For`
-checked. Otherwise the TCP peer address is used. The request body limit is 256 KiB. `RETENTION_DAYS`
-defaults to 45 days; delivery records are kept for 30 days
-and delivered event records follow the configured retention.
+## Quick start
 
-### Store provider setup
+Rust and Docker are required. Postgres 16 is the version used by [docker-compose.yml](docker-compose.yml) and CI.
 
-The store-specific setup is documented separately:
+```sh
+git clone https://github.com/vant-labs/hooks-fanout.git
+cd hooks-fanout
+cp .env.example .env
+docker compose up -d postgres
+git config core.hooksPath .githooks
+```
 
-- [Apple App Store setup](docs/apple-store-setup.md)
-- [Google Play setup](docs/google-play-setup.md)
+`cargo` does not load `.env`. Export the variables the process and the Postgres tests expect. `MASTER_ENCRYPTION_KEY` must be 32 bytes, hex or base64. `FANOUT_ENCRYPTION_KEY` is accepted as an alternate name for that key. `PAYSTACK_SECRET_KEY` is the first-boot secret for the example Paystack source and is also required by the signed integration tests.
 
-### App Store Connect webhooks
+```sh
+export DATABASE_URL=postgres://fanout:fanout@localhost:5432/fanout
+export MASTER_ENCRYPTION_KEY="$(openssl rand -hex 32)"
+export ADMIN_BOOTSTRAP_TOKEN="$(openssl rand -hex 24)"
+export PAYSTACK_SECRET_KEY=sk_test_replace_me
+export PUBLIC_BASE_URL=http://localhost:8080
+cargo test
+cargo run -- --role all
+```
 
-Configure an App Store Connect webhook source with provider
-`apple_connect_webhooks`. App Store Connect sends the original JSON body and an
-`x-apple-signature` header in the form `hmacsha256=<hex>`. The adapter verifies
-the body with the secret configured for the webhook, then forwards the body and
-signature unchanged. Event type comes from the webhook event `type` and the
-event ID comes from its `id`; the app ID is taken from the documented app
-fields when present and is used for route matching.
+Every command, including `create-owner`, requires `DATABASE_URL`, `MASTER_ENCRYPTION_KEY` or `FANOUT_ENCRYPTION_KEY`, and `ADMIN_BOOTSTRAP_TOKEN` or `ADMIN_TOKEN`. The listener binds `0.0.0.0` and reads `PORT`, default `8080`. With the default source, the Paystack URL is `${PUBLIC_BASE_URL}/in/paystack_main`.
 
-In App Store Connect, open Users and Access → Integrations → Webhooks, create a
-webhook, enter the payload URL `/in/{source}`, choose the app, set a secret,
-and select the event triggers. The current event families include build upload
-state, app version state, beta feedback crash, and beta feedback screenshot
-events. Use a route with `app_identifier` for an app-specific destination, or
-set the fallback to `route:<name>` for a whole-account destination. Keep these
-routes separate from payment routes.
+`--role` is `all` (default), `ingest`, or `worker`. `all` and `ingest` serve HTTP. `all` and `worker` run delivery, retention, and store reconciliation.
 
-Apple's current setup and signing details are documented in [Manage webhooks](https://developer.apple.com/help/app-store-connect/manage-your-team/manage-webhooks), [Configuring and parsing webhook notifications](https://developer.apple.com/documentation/appstoreconnectapi/configuring-webhook-notifications), and [WebhookEventType](https://developer.apple.com/documentation/appstoreconnectapi/webhookeventtype).
+Create the first owner after migrations. The command refuses to run when an owner already exists, prompts twice, and requires a password of at least 12 characters. `FANOUT_OWNER_PASSWORD` and `FANOUT_OWNER_PASSWORD_CONFIRM` supply the password without a prompt.
 
-### Purchase verification and entitlements
+```sh
+cargo run -- create-owner --email owner@example.com
+```
 
-The client purchase flow is server-authoritative:
+Open `/login`. `COOKIE_SECURE` defaults to true, so the session cookie is `Secure`. Set `COOKIE_SECURE=false` for local HTTP. `docker compose` sets that for the bundled `app` service. The image entrypoint is `/usr/local/bin/paystack-fanout`. Logging uses the crate target, for example `RUST_LOG=paystack_fanout=info`.
+
+`POST /admin/bootstrap` with the bootstrap bearer token can create that first account as well. Send `{"email":"...","password":"..."}`.
+
+## Configuration
+
+`FANOUT_CONFIG` is optional. When it is unset or missing, startup seeds one Paystack source named `paystack_main`, no routes, fallback `unrouted`, and 45-day retention. That default source has an empty IP allowlist, so it accepts any peer until you set `allowed_ips`.
+
+`secret_env` and other `*_env` keys are copied into encrypted Postgres columns while those stored values are still empty. Dashboard and admin edits after that replace the stored secret. The request body limit is 256 KiB.
+
+Set `PUBLIC_BASE_URL` to the public origin. The Sources panel shows `https://your-host/in/{slug}` from that value. Source and route APIs:
+
+- `GET` and `POST /admin/sources`, `PATCH` and `DELETE /admin/sources/{slug}`
+- `GET` and `POST /admin/routes`, `PATCH` and `DELETE /admin/routes/{name}`
+
+`RETENTION_DAYS` overrides retention and must be from 1 to 45. The default is 45. Delivered and dead delivery rows are removed after 30 days. Raw event bodies are cleared after the retention window, and delivered events are deleted after it.
+
+`[alerts] webhook_url_env` names an env var such as `ALERT_WEBHOOK_URL`. The alert body is a short JSON object like `{"text":"..."}`.
+
+Purchase bearer checks run in order. A token that decodes with `PURCHASE_JWT_SECRET` (HS256; `JWT_SECRET` is an alternate name) supplies the account from `sub` or `account_id`, which must agree when both are present. A bearer that matches `PURCHASE_BEARER_TOKEN`, `ADMIN_TOKEN`, or `ADMIN_BOOTSTRAP_TOKEN` uses `PURCHASE_BEARER_ACCOUNT_ID`. Any other bearer is sent to `GET {TIMAMU_API_BASE_URL}/v1/account/session`, which defaults to `http://localhost:8080`, and the account is read from `accountId` or `account_id`.
+
+### Dashboard
+
+The console is server-rendered in the same binary. Pages after sign-in:
+
+- `/admin` queue health for 24 hours and 7 days
+- `/dashboard/events`, plus CSV and NDJSON export
+- `/dashboard/events/{id}` raw payload, masked headers, the response returned to the provider, the routing decision, and delivery attempts (admin and owner)
+- `/dashboard/retries` and `/dashboard/unrouted`
+- `/dashboard/config` sources, routes, write-only secrets, and matcher tests
+- `/dashboard/users` (admin and owner), `/dashboard/audit`, and `/dashboard/settings`
+
+Overview and Events subscribe to `/dashboard/overview/live` and `/dashboard/events/live` with the session cookie. The proxy in front of the process must pass `text/event-stream` through without buffering. A `401` means the session is missing or expired.
+
+| Role | Read lists, queues, and non-raw export | Replay, retry, edit routes and sources, raw event detail, raw export | Manage users |
+| --- | --- | --- | --- |
+| Viewer | Yes | No | No |
+| Admin | Yes | Yes | Yes |
+| Owner | Yes | Yes | Yes |
+
+Passwords use Argon2id. Login attempts are rate limited in memory on each process. A TOTP code is required when that user has one configured. Mutating forms send a session-bound CSRF value. Sessions use an HttpOnly, SameSite=Lax cookie and rotate on sign-in.
+
+Light mode:
+
+![Fanout console overview in light mode](docs/screenshots/dashboard-light.png)
+
+Dark mode:
+
+![Fanout console overview in dark mode](docs/screenshots/dashboard-dark.png)
+
+### Purchases and entitlements
+
+`POST /v1/purchases/verify` and `GET /v1/entitlements` use the bearer identity above. The verify body accepts `provider`, `receipt` or `purchaseToken`, and optional `productId`. Unknown JSON fields are rejected. `X-Timamu-Account-Id` is not read.
 
 ```http
 POST /v1/purchases/verify
@@ -184,212 +185,44 @@ Authorization: Bearer <account JWT>
 {"provider":"apple","receipt":"<transaction-id-or-signed-transaction>"}
 ```
 
-For Google Play, use `purchaseToken` and optionally `productId`. The adapter
-verifies the purchase with the store API, checks the configured app identifier,
-product mapping and environment, acknowledges pending purchases, and emits
-the same normalized event used by notifications. A purchase identity is owned
-by one account; a second account receives `409` and the attempt is audited.
+For Apple, the verified `appAccountToken` must equal the bearer account. A purchase identity belongs to one account; a second account receives `409`.
 
-The purchase endpoints require a verified bearer identity. The account ID is
-read only from the JWT `sub` or `account_id` claim (or from a configured static
-bearer identity); body, query, and `X-Timamu-Account-Id` values are ignored or
-rejected. For Apple, the verified `appAccountToken` must equal that identity.
-Clients must read `GET /v1/entitlements` with the same bearer token. They must
-not grant access from a local receipt or token check. Set `PURCHASE_JWT_SECRET`
-for HS256 account JWTs, or use `PURCHASE_BEARER_TOKEN` together with
-`PURCHASE_BEARER_ACCOUNT_ID` for a static account-bound bearer identity.
-Configure store sources from the Sources panel with non-secret
-`provider_config` mappings such as `app_identifier`, `environment`,
-`api_base_url` (for a test server), and `product_licence.<product-id>`. Put
-`key_id`, `issuer_id`, `private_key`, or `service_account_key` in the encrypted
-credentials JSON field. Existing `*_env` names are imported once at startup
-when the corresponding DB value is absent and are then deprecated.
+Store credentials such as `key_id`, `issuer_id`, `private_key`, and `service_account_key` belong in the encrypted credentials JSON. Non-secret `provider_config` holds `app_identifier`, `environment`, `api_base_url`, and `product_licence.<product-id>`.
 
-An alert destination may be enabled with:
+## Delivery
 
-```toml
-[alerts]
-webhook_url_env = "ALERT_WEBHOOK_URL"
-```
+The worker claims rows with `FOR UPDATE SKIP LOCKED`. A 2xx response marks the delivery delivered. Other responses and network errors follow this delay while `attempt` is still below the route's `max_attempts`: 30s, 2m, 10m, 30m, 1h, 3h, 6h, 12h, and 24h. Jitter scales each delay to between 80% and 120%. There is no delay after attempt 9. The routes table defaults `max_attempts` to 10. `POST /admin/routes` stores `3`. The dashboard accepts 1 through 10. Attempt records keep at most 2048 bytes of the response body.
 
-The service sends a generic JSON body such as `{"text":"..."}`. It never
-puts the event body, customer email, or phone number in logs or alert text.
+Webhook ingest forwards the original ingress bytes. A delivery created by `POST /v1/purchases/verify` has `forward_original_body` off, so the worker sends the normalized event JSON when that body is stored. Each attempt adds `x-fanout-event-id` and `x-fanout-attempt`. Forwarded headers are limited to `content-type`, `x-paystack-signature`, `x-apple-signature`, `x-apple-notification-signature`, `x-apple-connect-signature`, `x-google-signature`, and `x-goog-signature`. Inbound `Authorization` and `x-fanout-signature` are not copied.
 
-## Routing rules
+Route outbound authentication is stored in Postgres:
 
-The first matching route wins, using this precedence:
+- `none` leaves the forwarded provider headers as they are.
+- `static_header` sends the encrypted secret as the configured header value.
+- `hmac_sha512` sends a lowercase hex HMAC-SHA512 of the exact forwarded bytes.
 
-1. `data.metadata.app`, or a `data.metadata.custom_fields` item whose
-   `variable_name` is `app` and whose `value` is the application name.
-2. `data.plan.plan_code`, `data.subscription.plan.plan_code`, or `data.plan`
-   when `data.plan` is a string. The configured value is a prefix.
-3. `data.reference`, then `data.subscription_code`, then
-   `data.customer_code` when a reference is absent. The configured value is a
-   prefix.
-4. `app_identifier` matches a store bundle ID or package name.
-5. `environment` matches `production` or `sandbox`.
+The configured header replaces a same-named inbound header. Saved secrets are masked and are not returned by the admin API. A blank secret on edit keeps the stored value. Existing routes stay on `none` until an administrator changes them. The worker reads the current route settings when it claims a delivery.
 
-Within a route, a configured matcher is a candidate for that precedence level;
-the other legacy matchers do not have to be present. `app_identifier` and
-`environment`, when both are configured, must both match. This lets a product
-route store notifications to the correct application and environment.
+Admin API destinations must be public `https` URLs without embedded credentials. Redirects are disabled. Private or local DNS answers are rejected and the validated public address is pinned for that request. See [docs/security-report.md](docs/security-report.md) for the engineering review of those controls. That document is a review of this repository, with residual findings, and it is not a certification.
 
-If no route matches, `fallback.mode = "unrouted"` stores the event without a
-delivery and sends an alert. `fallback.mode = "route:name"` sends it to that
-route, which is useful during rollout.
+Duplicate events for one source return `200` and do not enqueue another delivery. Paystack's duplicate key is a hash of the raw body. Invalid provider authentication returns `401` and is not stored.
 
-### Routing Apple and Play apps
+### Operations
 
-Point App Store Server Notifications V2 at the existing source URL
-`/in/apple_production` or `/in/apple_sandbox`, and point Google Play RTDN at
-`/in/google_production` (or another configured source). In the dashboard,
-create one route row per destination and set its `app_identifier` to the
-verified Apple `bundleId` or Google `packageName`, plus `environment` when the
-source is environment-specific. The same account may therefore have multiple
-Apple or Play apps routed to different destinations. Adding another Vant app
-means adding another source/route row with its identifiers; it does not require
-new Fanout code or a new silo. An unknown identifier has no default app and is
-stored in the unrouted queue.
+`/healthz` is liveness. `/readyz` returns `503` when Postgres is unreachable. It returns `200` with `ready_with_missing_settings` when a source that requires a secret has none stored and none in its `secret_env`. `/metrics` is Prometheus text: `fanout_received`, `fanout_verified_failed`, `fanout_duplicates`, `fanout_delivered`, `fanout_retries`, `fanout_dead`, `fanout_unrouted`, `fanout_would_unrouted`, and a delivery latency histogram.
 
-### Fresh-fork setup checklist
+`/docs` redirects to `/docs/`, which links to the OpenAPI document at `/api-docs/openapi.json`.
 
-After the first boot, configure a new deployment in this order:
-
-1. Open `/login` and sign in with the first account created by
-   `cargo run -- create-owner --email you@example.com`, or call
-   `POST /admin/bootstrap` once with `ADMIN_BOOTSTRAP_TOKEN`.
-2. Open `/dashboard/config` and create one Source for each provider ingress.
-   The source slug becomes `/in/{slug}` and the dashboard shows the exact URL
-   to paste into Paystack, App Store Server Notifications, or Pub/Sub.
-3. Add a Route for each destination. Set the app identifier to the Apple
-   bundle ID or Google package name and set the environment when needed.
-4. Select the outbound authentication mode on that Route. Secrets are stored
-   encrypted, masked after saving, and can be replaced without a redeploy.
-5. Send a provider test notification, then inspect the event detail page. It
-   shows the original request, the response returned to the provider, the
-   routing decision, and downstream delivery attempts.
-6. Open Overview and Events in separate browser tabs and verify their live
-   streams in the Network panel before handing the deployment to operators.
-
-Do not copy production URLs, provider secrets, service-account JSON, private
-keys, bearer tokens, or database credentials into a fork, issue, screenshot,
-fixture, README, or commit. Use placeholders such as
-`https://your-public-host.example` and `https://your-destination.example` in
-public documentation. Keep `.env` and downloaded credential files out of Git.
-
-## How to tag payments
-
-Use one stable convention per product:
-
-- Prefer `metadata.app = "timamu"` or `"screencrafter"`.
-- For Checkout or API flows that already use references, use `tm_...` and
-  `sc_...` prefixes.
-- For subscription products, use plan code prefixes such as `PLN_tm...` and
-  `PLN_sc...`.
-
-The router does not modify a payload or create a new signature. Each product
-continues to verify Paystack's signature itself. For store routes, configure
-the outbound authentication mode in the Routes panel; do not rely on an
-inbound provider header as the relay credential.
-
-The OWASP-aligned review, evidence references, residual findings, and
-deployment-dependent controls are tracked in
-[`docs/security-report.md`](docs/security-report.md). It is an engineering
-review, not a certification or a substitute for production verification.
-
-### Route outbound authentication
-
-Routes support three database-backed modes:
-
-- `none` preserves existing route behavior.
-- `static_header` sends the literal encrypted secret as the configured header value.
-- `hmac_sha512` generates a new lowercase hexadecimal HMAC-SHA512 value for
-  every attempt over the exact stored body bytes.
-
-The Routes panel masks saved secrets and never returns them through the admin
-API. Leaving the secret blank while editing keeps the stored value. The
-configured header replaces any same-named inbound header, and unsafe transport
-headers are rejected. For a store relay, select `hmac_sha512`, enter
-`x-fanout-signature`, and use the secret configured by the receiving service.
-This is a deployment setting, not a Fanout default.
-
-Inbound `Authorization` headers are never copied to a destination or retained
-in the event header record. Provider credentials are used only for provider
-verification. Destination URLs must be public HTTP(S) endpoints without
-embedded credentials; redirects are disabled for outbound requests. If a
-deployment is behind a proxy, set `TRUST_PROXY=true` only with an explicit
-`TRUSTED_PROXY_CIDRS` allowlist.
-
-Every pull request runs formatting, lint, tests, Docker smoke checks, and a
-dependency advisory audit. The audit configuration contains one documented
-exception for the RSA test-only key generator; it is not part of the release
-binary. Keep test credentials synthetic and rotate any credential that is ever
-accidentally committed.
-
-Migration `0014_store_forward_contract.sql` adds encrypted route-auth columns
-and marks existing deliveries to forward original bodies. Existing routes stay
-in `none` mode until an administrator explicitly changes them. Configuration
-changes are read when a delivery is claimed, so queued retries use the current
-route setting without replaying stale authentication headers or redeploying.
-
-## Paystack event fields
-
-The field list below follows Paystack's public webhook and product examples.
-Payloads are retained as raw bytes, so fields not listed here are preserved.
-
-| Event family | Documented fields used or useful for routing |
-| --- | --- |
-| `charge.success` | `data.reference`, `data.metadata`, `data.plan` |
-| `subscription.create` | `data.subscription_code`, `data.plan`, customer and metadata fields |
-| `subscription.disable` | `data.subscription_code`, `data.plan`, `status` |
-| `subscription.not_renew` | `data.subscription_code`, `data.plan`, `status` |
-| `invoice.create` | `data.invoice_code`, subscription/plan information in the invoice payload |
-| `invoice.update` | `data.invoice_code`, final invoice status, subscription/plan information |
-| `invoice.payment_failed` | `data.invoice_code`, failed invoice status and subscription information |
-| `transfer.success`, `transfer.failed`, `transfer.reversed` | `data.reference`, `data.transfer_code`, `data.status` |
-| `refund.pending`, `refund.processing`, `refund.processed`, `refund.failed` | `data.transaction_reference`, `data.refund_reference`, `data.status` |
-
-Paystack's refund examples use `transaction_reference`, not `reference`. The
-requested routing contract intentionally checks only `reference`,
-`subscription_code`, and `customer_code`, so refund events need
-`metadata.app`, a configured fallback, or a future routing rule. The current
-public examples also vary across event families; the router therefore does not
-deserialize a rigid event struct.
-
-References: [Paystack webhooks](https://paystack.com/docs/payments/webhooks/),
-[subscriptions](https://paystack.com/docs/payments/subscriptions/),
-[charge API](https://paystack.com/docs/api/charge/),
-[transfers](https://paystack.com/docs/transfers/single-transfers/), and
-[refunds](https://paystack.com/docs/payments/refunds/).
-
-## Delivery behavior
-
-The queue uses `FOR UPDATE SKIP LOCKED`, so multiple replicas claim separate
-deliveries. A 2xx response marks an event delivered. Other responses and
-network errors record an attempt and retry after 30s, 2m, 10m, 30m, 1h, 3h,
-6h, 12h, and 24h, with 20% jitter. Attempt 10 is terminal and marks the
-delivery dead. Response bodies are capped at 2 KiB in the attempt record.
-
-The stored event has the raw body, signature, content type, a safe header
-subset, event type, route, status, and receipt time. Invalid signatures return
-401 and are never stored. Duplicate raw bodies for one source return 200 with
-no new delivery.
-
-## Admin and operations
-
-When `ADMIN_TOKEN` or `ADMIN_BOOTSTRAP_TOKEN` is set, send `Authorization: Bearer ...` to:
+Send `Authorization: Bearer $ADMIN_TOKEN` to:
 
 - `GET /admin/events?status=&route=&type=&since=&limit=&offset=`
 - `GET /admin/events/{id}`
 - `POST /admin/events/{id}/replay` with optional `{"route":"timamu"}`
 - `POST /admin/replay?status=dead&route=timamu`
-- `GET /admin/routes`, `POST /admin/routes`, `PATCH /admin/routes/{name}`, and
-  `DELETE /admin/routes/{name}`
+- `GET` and `POST /admin/routes`, `PATCH` and `DELETE /admin/routes/{name}`
+- `GET` and `POST /admin/sources`, `PATCH` and `DELETE /admin/sources/{slug}`
 - `GET /admin/deliveries?reference=...`
-- `GET /admin/settings`, `PUT /admin/settings/{key}`, and
-  `DELETE /admin/settings/{key}`
-
-For example, add a store route with both matching conventions:
+- `GET /admin/settings`, `PUT /admin/settings/{key}`, and `DELETE /admin/settings/{key}`
 
 ```sh
 curl -X POST "$APP_URL/admin/routes" \
@@ -398,167 +231,41 @@ curl -X POST "$APP_URL/admin/routes" \
   -d '{"name":"store-payments","target_url":"https://your-destination.example/v1/webhooks/paystack","ref_prefix":"app_","metadata_app":"your-app","enabled":true}'
 ```
 
-For a store route, the same API accepts `outbound_auth_mode`,
-`outbound_auth_header`, and write-only `outbound_auth_secret`; for example,
-use `"outbound_auth_mode":"hmac_sha512"` and
-`"outbound_auth_header":"x-fanout-signature"`. The response exposes only
-whether a secret is stored.
+The same body accepts `outbound_auth_mode`, `outbound_auth_header`, and write-only `outbound_auth_secret`. `target_url` must be `https`, and at least one matcher field is required. Authorization failures are `404` on some event reads and `401` on route and source writes. When you are checking a deployment, use the status from `/api-docs/openapi.json` for that path.
 
-When the token is unset, admin routes return 404. `/healthz` is liveness,
-`/readyz` checks the database, and `/metrics` exposes Prometheus text metrics
-including received, signature failures, duplicates, deliveries, retries,
-dead events, unrouted events, shadow misses, and a delivery latency histogram.
+For a short Google RTDN troubleshooting session, set `FANOUT_DEBUG_AUTH=1`, send one notification, and read the logs. The extra line includes the authorization scheme, selected JWT header and payload claims, JWKS URL and fetch result, key-id lookup, and verification step. It does not include the bearer value or the JWT signature. Unset `FANOUT_DEBUG_AUTH` when the check is finished.
 
-Swagger UI is available at `/docs` (redirecting to `/docs/`), with the raw
-OpenAPI document at `/api-docs/openapi.json`.
+Responses include `X-Content-Type-Options: nosniff`, `Referrer-Policy: no-referrer`, `X-Frame-Options: DENY`, and `Content-Security-Policy` with `frame-ancestors 'none'`. Terminate TLS at the edge. Enable HSTS there after HTTPS is confirmed. Set `TRUST_PROXY=true` only when the direct peer is listed in `TRUSTED_PROXY_CIDRS`.
 
-## Deploy on Railway
+## Deploy
 
-1. Create a Railway project with a Postgres service.
-2. Deploy this repository as a Railway service. Railway builds directly from
-   the repository `Dockerfile`.
-3. Set these required variables in the service environment:
-   - `DATABASE_URL`: reference the Railway Postgres service variable, for
-     example `${{Postgres.DATABASE_URL}}`.
-   - `MASTER_ENCRYPTION_KEY`: create one with `openssl rand -hex 32`.
-   - `ADMIN_BOOTSTRAP_TOKEN`: a one-time token for creating the first admin.
-4. In Railway service settings, set the health check path to `/readyz`.
-5. Run `POST /admin/bootstrap` with the bootstrap bearer token and your email
-   and password after the first deploy, then enable 2FA.
-6. Use the service public URL as the Paystack webhook URL in test mode.
-7. In Sources, create `google_production`, `apple_production`, and
-   `apple_sandbox` with their provider settings and encrypted credentials. Use
-   the source URLs rendered by your dashboard, such as
-   `${PUBLIC_BASE_URL}/in/google_production`.
-8. Add routes and additional sources from the dashboard; no production route
-   file or redeploy is required.
+The [Dockerfile](Dockerfile) builds a release binary and starts `/usr/local/bin/paystack-fanout`. Required runtime variables are `DATABASE_URL`, `MASTER_ENCRYPTION_KEY`, and `ADMIN_BOOTSTRAP_TOKEN`.
 
-### Temporary Google RTDN authentication diagnostics
+On Railway:
 
-For a short-lived Google RTDN troubleshooting session only, set
-`FANOUT_DEBUG_AUTH=1` on the Railway service, send one test notification, and
-inspect the service logs. The extra Google-only diagnostic entry reports the
-authorization scheme, selected JWT header and payload claims, JWKS URL/fetch
-result, key-ID lookup, and verification step. It never logs the bearer value,
-JWT signature segment, or provider secret.
+1. Add Postgres and deploy this repository. Railway builds the Dockerfile.
+2. Set `DATABASE_URL` from the Postgres service, for example `${{Postgres.DATABASE_URL}}`.
+3. Set `MASTER_ENCRYPTION_KEY` from `openssl rand -hex 32` and set `ADMIN_BOOTSTRAP_TOKEN`.
+4. Set the health check path to `/readyz`.
+5. Call `POST /admin/bootstrap` with that token, then sign in and turn on TOTP.
+6. Put the public URL in Paystack test mode, then create `google_production`, `apple_production`, and `apple_sandbox` from Sources. Paste the URLs the dashboard renders, such as `${PUBLIC_BASE_URL}/in/google_production`.
 
-After the test, unset `FANOUT_DEBUG_AUTH` and remove this temporary diagnostic
-path in a follow-up change.
-
-## Rollout guide
-
-1. Deploy and point the Paystack TEST mode webhook at
-   `/in/paystack_main`; verify with test charges.
-2. Set `fallback = "route:screencrafter"` while tagging rolls out. Watch the
-`fanout_would_unrouted` metric and inspect route data.
-
-## Browser console
-
-The built-in console is server-rendered and ships inside the same binary. It
-uses Askama templates, a vendored htmx asset, and a small local stylesheet; no
-runtime asset host or separate frontend service is required.
-
-Pages are available after signing in:
-
-- `/admin` overview with 24-hour and seven-day queue health.
-- `/dashboard/events` filtered event ledger and streamed CSV or newline JSON exports.
-- `/dashboard/events/{id}` raw payload, masked request headers, response returned
-  to the provider, routing decision, and downstream attempts.
-- `/dashboard/retries` and `/dashboard/unrouted` operational queues.
-- `/dashboard/config` persisted sources, routes, encrypted write-only secrets, and matcher tests.
-- `/dashboard/users`, `/dashboard/audit`, and `/dashboard/settings` for access and policy.
-
-| Role | Read | Replay/retry | Edit routes and export | Manage users | Manage sources/secrets |
-| --- | --- | --- | --- | --- | --- |
-| Viewer | Yes | No | No | No | No |
-| Admin | Yes | Yes | Yes | Yes | Yes |
-| Owner | Yes | Yes | Yes | Yes | Yes |
-
-The JSON admin API remains available with `Authorization: Bearer $ADMIN_TOKEN`.
-The dashboard is available at `/admin`; all application secrets can be stored
-from the settings page or the settings API. Environment values override database
-values, while database values are encrypted with `MASTER_ENCRYPTION_KEY`.
-Browser sessions use an HttpOnly, SameSite=Lax cookie, rotate on sign-in, and
-require a session-bound CSRF value on every mutating form. Passwords use
-Argon2id. Login attempts are rate limited per account, and an optional TOTP
-code is checked when a user has one configured.
-
-### Transport and browser security
-
-The application adds `X-Content-Type-Options: nosniff`,
-`Referrer-Policy: no-referrer`, `Content-Security-Policy: frame-ancestors
-'none'`, and `X-Frame-Options: DENY` to successful and error responses. The
-dashboard does not require framing or embedding and should be served as a
-top-level application.
-
-Terminate HTTPS at the trusted edge or reverse proxy and restrict direct
-access to the application port. Set `COOKIE_SECURE=true` (the default) for
-HTTPS deployments; session cookies then include `Secure`, `HttpOnly`, and
-`SameSite=Lax`. Local HTTP development may set `COOKIE_SECURE=false` only in a
-local environment.
-
-Enable HSTS at the TLS edge after the HTTPS deployment is verified, for example
-with `Strict-Transport-Security: max-age=31536000; includeSubDomains` when all
-covered subdomains are HTTPS-only. Do not enable HSTS blindly for local HTTP
-development.
-
-Set `TRUST_PROXY=true` only when the direct peer is a controlled proxy listed
-in `TRUSTED_PROXY_CIDRS`. Otherwise `X-Forwarded-For` is ignored and the TCP
-peer address is used. Do not expose the application port directly to the
-public internet when relying on forwarded client headers.
-
-Configured relay destinations and provider API endpoints are resolved at request
-time; private or local DNS results are rejected and the validated public address
-is pinned for that request. Keep deployment egress controls in place as a second
-line of defense. CSV exports neutralize formula-leading values; use NDJSON when
-spreadsheet import is not required.
-
-### Screenshots
-
-Light mode:
-
-![Fanout console overview in light mode](docs/screenshots/dashboard-light.png)
-
-Dark mode:
-
-![Fanout console overview in dark mode](docs/screenshots/dashboard-dark.png)
-3. Switch the live webhook URL. Keep the ScreenCrafter fallback until
-   unrouted traffic is 0 for seven days, then set `fallback.mode = "unrouted"`.
-
-## Load smoke
-
-Run the local smoke against a running service with a small signed fixture:
-
-```sh
-seq 1 1000 | xargs -I{} -P8 curl -sS -o /dev/null -w '%{http_code}\n' \
-  -X POST http://localhost:8080/in/paystack_main \
-  -H 'content-type: application/json' \
-  -H "x-paystack-signature: $SIGNATURE" \
-  --data-binary @tests/fixtures/charge.success.json
-```
-
-Measure client-side latency with `hey` or `wrk` and keep the database on the
-same machine. The target is p99 below 200ms; record the observed result in
-your deployment notes because it depends on Postgres and disk speed.
-
-Local smoke on 2026-09-28 with Postgres 16 in Docker, the debug binary, and
-eight concurrent clients completed 1,000 unique signed events with p50 8.91ms,
-p95 36.18ms, p99 109.41ms, and max 206.60ms.
+Keep live hostnames, provider secrets, service-account JSON, private keys, and database URLs out of forks, issues, and commits.
 
 ## Tests
 
-Unit coverage includes signatures, routing precedence, all listed fixture
-event names, and the retry schedule. With `DATABASE_URL` set, the integration
-suite exercises ingestion, duplicate suppression, forwarding, retry state,
-replay, alert hooks, and concurrent queue claims. The CI workflow starts
-Postgres, runs migrations, then runs formatting, linting, tests, and the Docker
-build.
+`cargo test` runs signature, routing, fixture, and retry-schedule tests without Postgres. Integration tests run when `DATABASE_URL` and, where they sign Paystack fixtures, `PAYSTACK_SECRET_KEY` are set. CI starts Postgres 16 and runs formatting, lint, tests, a Docker smoke check, a dependency audit, a secret scan, and a repository text check. A local signed request can use `tests/fixtures/charge.success.json` against `POST /in/paystack_main` with `x-paystack-signature`.
 
-## Project boundaries
+## Contributing
 
-There is no billing, hosted multi-customer mode, or payload re-signing. The
-Provider trait owns source authentication, event identity, event type, and
-routing fields so additional provider payloads do not change the queue
-contract.
+There is no separate contributing guide. Enable the repository commit hook before you commit:
 
-Use conventional commit messages. License: MIT.
+```sh
+git config core.hooksPath .githooks
+```
+
+CI on pull requests is [.github/workflows/ci.yml](.github/workflows/ci.yml).
+
+## License
+
+[MIT](LICENSE). Copyright (c) 2026 Vant Inc.
